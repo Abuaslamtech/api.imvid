@@ -22,7 +22,7 @@ const PLATFORM_CONFIG = {
   },
   instagram: {
     name: 'instagram',
-    cookies: ['--cookies-from-browser', 'firefox'], 
+    cookies: null, 
     format: 'best'
   },
   tiktok: {
@@ -32,7 +32,7 @@ const PLATFORM_CONFIG = {
   },
   facebook: {
     name: 'facebook',
-    cookies: ['--cookies-from-browser', 'firefox'],
+    cookies:null,
     format: 'best'
   }
 };
