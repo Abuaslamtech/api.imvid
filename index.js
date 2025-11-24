@@ -3,7 +3,7 @@ const YTDlpWrap = require('yt-dlp-wrap').default;
 const path = require('path');
 const fs = require('fs').promises;
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 const ytdlpPath = path.resolve(__dirname, 'yt-dlp');
 const ytdlpWrap = new YTDlpWrap();
@@ -13,28 +13,18 @@ const downloadDir = path.resolve(__dirname, 'downloads');
 const metadataCache = new Map();
 const CACHE_TTL = 3600000; // 1 hour
 
-// Platform detection & cookies config
+// Updated platform config with better YouTube handling
 const PLATFORM_CONFIG = {
-  youtube: {
-    name: 'youtube',
-    cookies: null,
-    format: '(bestvideo+bestaudio/best)[ext=mp4]'
+  youtube: { 
+    format: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
+    extraArgs: [
+      '--extractor-args', 'youtube:player_client=android,web',
+      '--user-agent', 'com.google.android.youtube/19.09.37 (Linux; U; Android 13) gzip'
+    ]
   },
-  instagram: {
-    name: 'instagram',
-    cookies: null, 
-    format: 'best'
-  },
-  tiktok: {
-    name: 'tiktok',
-    cookies: null,
-    format: 'best'
-  },
-  facebook: {
-    name: 'facebook',
-    cookies:null,
-    format: 'best'
-  }
+  instagram: { format: 'best', extraArgs: [] },
+  tiktok: { format: 'best', extraArgs: [] },
+  facebook: { format: 'best', extraArgs: [] }
 };
 
 async function ensureDownloadDir() {
@@ -66,105 +56,106 @@ function setCached(key, data) {
   metadataCache.set(key, { data, time: Date.now() });
 }
 
-function getBestFormat(formats, ext = 'mp4') {
+function getBestFormat(formats) {
+  // Find best MP4 format with both audio and video
   return formats
-    .filter(f => {
-      if (ext === 'mp4') {
-        return f.acodec !== 'none' && f.vcodec !== 'none' && f.ext === 'mp4';
-      }
-      return f.acodec !== 'none';
-    })
-    .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+    .filter(f => f.ext === 'mp4' && f.acodec !== 'none' && f.vcodec !== 'none')
+    .sort((a, b) => (b.height || 0) - (a.height || 0))[0] 
+    || formats.find(f => f.ext === 'mp4') // Fallback to any MP4
+    || formats[0]; // Last resort
 }
+
+function generateId() {
+  return `vid_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.send({ status: 'ok', uptime: process.uptime() });
+});
 
 app.get('/extract', async (req, res) => {
   const videoUrl = req.query.url;
   
   if (!videoUrl) {
-    return res.status(400).send({ error: 'URL query parameter is required' });
+    return res.status(400).json({ error: 'URL query parameter is required' });
   }
 
   try {
-    // Detect platform
     const platform = detectPlatform(videoUrl);
     if (!platform) {
-      return res.status(400).send({ error: 'Unsupported platform. Supported: YouTube, Instagram, TikTok, Facebook' });
+      return res.status(400).json({ 
+        error: 'Unsupported platform. Supported: YouTube, Instagram, TikTok, Facebook' 
+      });
     }
 
-    const platformConfig = PLATFORM_CONFIG[platform];
-    
     // Check cache first
     const cached = getCached(videoUrl);
     if (cached) {
       console.log(`✅ Serving ${platform} from cache`);
-      return res.send(cached);
-    }
-
-    // Build flags for yt-dlp
-    const flags = ['--skip-download'];
-    
-    // Add cookies for platforms that need authentication
-    if (platformConfig.cookies) {
-      flags.push(...platformConfig.cookies);
+      return res.json(cached);
     }
 
     console.log(`📥 Extracting ${platform} metadata...`);
     
-    // Fetch metadata only (no download)
-    const metadata = await ytdlpWrap.getVideoInfo(videoUrl, flags);
-    
-    const streamFormat = getBestFormat(metadata.formats, 'mp4');
-    const downloadFormat = getBestFormat(metadata.formats, 'mp4');
+    // Build args with platform-specific options
+    const config = PLATFORM_CONFIG[platform];
+    const args = [
+      videoUrl,
+      '--dump-json',
+      '--no-warnings',
+      ...config.extraArgs
+    ];
 
-    if (!streamFormat) {
-      return res.status(500).send({ error: 'No suitable format found' });
+    // Fetch metadata using execPromise for better control
+    const stdout = await ytdlpWrap.execPromise(args);
+    const metadata = JSON.parse(stdout);
+    
+    const bestFormat = getBestFormat(metadata.formats || []);
+
+    if (!bestFormat) {
+      return res.status(500).json({ error: 'No suitable format found' });
     }
 
+    const videoId = metadata.id || metadata.video_id || generateId();
+    
     const response = {
       title: metadata.title || 'Unknown Title',
       author: metadata.uploader || metadata.channel || 'Unknown Author',
       thumbnail: metadata.thumbnail || null,
       duration: metadata.duration || 0,
       platform: platform,
-      videoId: metadata.id || metadata.video_id || generateId(),
-      streamUrl: streamFormat.url,
-      downloadUrl: `/download?vid=${metadata.id || metadata.video_id || generateId()}`,
-      filesize: downloadFormat.filesize || downloadFormat.filesize_approx || null,
-      resolution: `${downloadFormat.height || 'unknown'}p`,
-      format: downloadFormat.ext || 'mp4'
+      videoId: videoId,
+      streamUrl: bestFormat.url,
+      downloadUrl: `/download?vid=${videoId}`,
+      filesize: bestFormat.filesize || bestFormat.filesize_approx || null,
+      resolution: `${bestFormat.height || 'unknown'}p`,
+      format: bestFormat.ext || 'mp4'
     };
 
     setCached(videoUrl, response);
-    res.send(response);
+    res.json(response);
 
-    // Predownload in background (non-blocking)
-    predownloadVideo(videoUrl, response.videoId, platformConfig).catch(err => 
-      console.error(`Background download failed for ${response.videoId}:`, err.message)
+    // Pre-download in background (non-blocking)
+    predownloadVideo(videoUrl, videoId, config).catch(err => 
+      console.error(`Background download failed for ${videoId}:`, err.message)
     );
 
   } catch (error) {
     console.error('Extract error:', error);
     
-    // Check for Instagram authentication error
-    if (error.message.includes('Instagram') && error.message.includes('login')) {
-      return res.status(403).send({ 
-        error: 'Instagram authentication required', 
-        details: 'Please ensure Instagram cookies are available. Run: yt-dlp --cookies-from-browser chrome',
-        solution: 'Make sure you are logged into Instagram in your browser'
-      });
+    // Provide more helpful error messages
+    let errorMsg = 'Failed to fetch video information';
+    if (error.message.includes('bot')) {
+      errorMsg = 'YouTube bot detection triggered. Try using cookies or a different video.';
+    } else if (error.message.includes('Sign in')) {
+      errorMsg = 'Video requires authentication or may be age-restricted.';
+    } else if (error.message.includes('Private video')) {
+      errorMsg = 'This video is private and cannot be accessed.';
     }
     
-    // Check for Facebook authentication error
-    if (error.message.includes('Facebook') && error.message.includes('login')) {
-      return res.status(403).send({ 
-        error: 'Facebook authentication required', 
-        details: 'Please ensure Facebook cookies are available. Run: yt-dlp --cookies-from-browser chrome',
-        solution: 'Make sure you are logged into Facebook in your browser'
-      });
-    }
-
-    res.status(500).send({ 
-      error: 'Failed to fetch video information', 
+    res.status(500).json({ 
+      error: errorMsg, 
       details: error.message,
       platform: detectPlatform(videoUrl)
     });
@@ -176,33 +167,26 @@ async function predownloadVideo(videoUrl, videoId, platformConfig) {
   const filePath = path.join(downloadDir, `${videoId}.mp4`);
   
   try {
-    const stat = await fs.stat(filePath).catch(() => null);
-    if (stat) {
+    // Check if already exists
+    const exists = await fs.stat(filePath).catch(() => null);
+    if (exists) {
       console.log(`✅ Video ${videoId} already downloaded`);
       return;
     }
 
     console.log(`⬇️ Starting background download: ${videoId}`);
     
-    // Build download flags
-    const flags = [
+    const args = [
       videoUrl,
       '-f', platformConfig.format,
       '-o', filePath,
-      '--quiet'
+      '--quiet',
+      '--no-warnings',
+      ...platformConfig.extraArgs
     ];
 
-    // Add cookies if needed
-    if (platformConfig.cookies) {
-      flags.push(...platformConfig.cookies);
-    }
-
-    // Convert to MP4 if necessary
-    if (platformConfig.name !== 'youtube') {
-      flags.push('--remux-video', 'mp4');
-    }
-
-    await ytdlpWrap.execPromise(flags);
+    await ytdlpWrap.execPromise(args);
+    
     console.log(`✅ Download complete: ${videoId}`);
   } catch (error) {
     console.error(`❌ Download error for ${videoId}:`, error.message);
@@ -214,7 +198,7 @@ app.get('/download', async (req, res) => {
   const videoId = req.query.vid;
   
   if (!videoId) {
-    return res.status(400).send({ error: 'vid query parameter required' });
+    return res.status(400).json({ error: 'vid query parameter required' });
   }
 
   const filePath = path.join(downloadDir, `${videoId}.mp4`);
@@ -231,10 +215,12 @@ app.get('/download', async (req, res) => {
     
     stream.on('error', (err) => {
       console.error('Stream error:', err);
-      res.status(500).send({ error: 'Failed to stream file' });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to stream file' });
+      }
     });
   } catch (error) {
-    return res.status(404).send({ 
+    res.status(404).json({ 
       error: 'Video not downloaded yet', 
       message: 'Try again in a few moments',
       videoId: videoId
@@ -247,20 +233,20 @@ app.get('/status', async (req, res) => {
   const videoId = req.query.vid;
   
   if (!videoId) {
-    return res.status(400).send({ error: 'vid query parameter required' });
+    return res.status(400).json({ error: 'vid query parameter required' });
   }
 
   const filePath = path.join(downloadDir, `${videoId}.mp4`);
 
   try {
     const stat = await fs.stat(filePath);
-    res.send({
+    res.json({
       status: 'ready',
       size: stat.size,
       videoId: videoId
     });
   } catch (error) {
-    res.send({
+    res.json({
       status: 'downloading',
       message: 'File is being prepared',
       videoId: videoId
@@ -268,52 +254,61 @@ app.get('/status', async (req, res) => {
   }
 });
 
-// Cleanup old files
+// Cleanup old files (runs on startup and every 6 hours)
 async function cleanupOldFiles() {
   try {
     const files = await fs.readdir(downloadDir);
     const now = Date.now();
-    const maxAge = 7 * 24 * 3600 * 1000; // 7 days
+    const maxAge = 24 * 3600 * 1000; // 24 hours
     
+    let deletedCount = 0;
     for (const file of files) {
       const filePath = path.join(downloadDir, file);
       const stat = await fs.stat(filePath);
       if (now - stat.mtimeMs > maxAge) {
         await fs.unlink(filePath);
-        console.log(`🗑️ Deleted old file: ${file}`);
+        deletedCount++;
       }
+    }
+    if (deletedCount > 0) {
+      console.log(`🗑️ Deleted ${deletedCount} old file(s)`);
     }
   } catch (error) {
     console.error('Cleanup error:', error);
   }
 }
 
-function generateId() {
-  return `vid_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-}
-
 async function initializeApp() {
   try {
-    // Check if yt-dlp binary already exists in the root folder
+    // Check if yt-dlp binary exists
     const binaryName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
     const binaryPath = path.join(__dirname, binaryName);
     
     const binaryExists = await fs.stat(binaryPath).catch(() => null);
     
     if (!binaryExists) {
-      console.log('📥 Downloading yt-dlp for the first time...');
+      console.log('📥 Downloading yt-dlp...');
       await YTDlpWrap.downloadFromGithub(ytdlpPath);
     } else {
-      console.log(`✅ yt-dlp already exists, skipping download`);
+      console.log(`✅ yt-dlp binary found`);
+    }
+    
+    // Make sure binary is executable (Unix-like systems)
+    if (process.platform !== 'win32') {
+      await fs.chmod(binaryPath, 0o755).catch(() => {});
     }
     
     ytdlpWrap.setBinaryPath(ytdlpPath);
     await ensureDownloadDir();
     
+    // Cleanup old files on startup
+    await cleanupOldFiles();
+    
     app.listen(port, () => {
-      console.log(`🚀 Multi-Platform Video Extractor running at http://localhost:${port}`);
+      console.log(`🚀 Video Extractor API running on port ${port}`);
       console.log(`📺 Supported: YouTube, Instagram, TikTok, Facebook`);
       console.log(`\nEndpoints:`);
+      console.log(`  GET /health - Health check`);
       console.log(`  GET /extract?url={videoUrl} - Extract metadata`);
       console.log(`  GET /download?vid={videoId} - Download video`);
       console.log(`  GET /status?vid={videoId} - Check download status`);
