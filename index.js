@@ -1,14 +1,14 @@
-const express = require('express');
-const YTDlpWrap = require('yt-dlp-wrap').default;
-const path = require('path');
-const fs = require('fs').promises;
+const express = require("express");
+const YTDlpWrap = require("yt-dlp-wrap").default;
+const path = require("path");
+const fs = require("fs").promises;
 const app = express();
 const port = process.env.PORT || 3000;
 
-const ytdlpPath = path.resolve(__dirname, 'yt-dlp');
+const ytdlpPath = path.resolve(__dirname, "yt-dlp");
 const ytdlpWrap = new YTDlpWrap();
-const downloadDir = path.resolve(__dirname, 'downloads');
-const cookiesPath = path.resolve(__dirname, 'youtube-cookies.txt');
+const downloadDir = path.resolve(__dirname, "downloads");
+const cookiesPath = path.resolve(__dirname, "youtube-cookies.txt");
 
 // Simple in-memory cache with TTL
 const metadataCache = new Map();
@@ -16,48 +16,53 @@ const CACHE_TTL = 3600000; // 1 hour
 
 // Updated platform config with better YouTube handling
 const PLATFORM_CONFIG = {
-  youtube: { 
-    format: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
+  youtube: {
     extraArgs: [
-      '--extractor-args', 'youtube:player_client=android,web',
-      '--user-agent', 'com.google.android.youtube/19.09.37 (Linux; U; Android 13) gzip',
-      '--cookies', cookiesPath  // Add cookies support
-    ]
+      "--extractor-args",
+      "youtube:player_client=android,web",
+      "--user-agent",
+      "com.google.android.youtube/19.09.37 (Linux; U; Android 13) gzip",
+      "--cookies",
+      cookiesPath, // Add cookies support
+    ],
   },
-  instagram: { format: 'best', extraArgs: [] },
-  tiktok: { format: 'best', extraArgs: [] },
-  facebook: { format: 'best', extraArgs: [] }
+  instagram: { format: "best", extraArgs: [] },
+  tiktok: { format: "best", extraArgs: [] },
+  facebook: { format: "best", extraArgs: [] },
 };
 
 async function ensureDownloadDir() {
   try {
     await fs.mkdir(downloadDir, { recursive: true });
   } catch (e) {
-    console.error('Failed to create download dir:', e);
+    console.error("Failed to create download dir:", e);
   }
 }
 
 async function checkCookies() {
   try {
     await fs.access(cookiesPath);
-    console.log('✅ YouTube cookies file found');
+    console.log("✅ YouTube cookies file found");
     return true;
   } catch {
-    console.warn('⚠️ No YouTube cookies found. YouTube downloads may fail.');
-    console.warn('   Export cookies to: youtube-cookies.txt');
+    console.warn("⚠️ No YouTube cookies found. YouTube downloads may fail.");
+    console.warn("   Export cookies to: youtube-cookies.txt");
     // Remove cookies arg if file doesn't exist
-    PLATFORM_CONFIG.youtube.extraArgs = PLATFORM_CONFIG.youtube.extraArgs.filter(
-      arg => arg !== '--cookies' && arg !== cookiesPath
-    );
+    const i = PLATFORM_CONFIG.youtube.extraArgs.indexOf("--cookies");
+    if (i !== -1) {
+      PLATFORM_CONFIG.youtube.extraArgs.splice(i, 2); // remove --cookies & path together
+    }
+
     return false;
   }
 }
 
 function detectPlatform(url) {
-  if (url.includes('youtube.com') || url.includes('youtu.be')) return 'youtube';
-  if (url.includes('instagram.com')) return 'instagram';
-  if (url.includes('tiktok.com')) return 'tiktok';
-  if (url.includes('facebook.com') || url.includes('fb.watch')) return 'facebook';
+  if (url.includes("youtube.com") || url.includes("youtu.be")) return "youtube";
+  if (url.includes("instagram.com")) return "instagram";
+  if (url.includes("tiktok.com")) return "tiktok";
+  if (url.includes("facebook.com") || url.includes("fb.watch"))
+    return "facebook";
   return null;
 }
 
@@ -76,11 +81,15 @@ function setCached(key, data) {
 
 function getBestFormat(formats) {
   // Find best MP4 format with both audio and video
-  return formats
-    .filter(f => f.ext === 'mp4' && f.acodec !== 'none' && f.vcodec !== 'none')
-    .sort((a, b) => (b.height || 0) - (a.height || 0))[0] 
-    || formats.find(f => f.ext === 'mp4') // Fallback to any MP4
-    || formats[0]; // Last resort
+  return (
+    formats
+      .filter(
+        (f) => f.ext === "mp4" && f.acodec !== "none" && f.vcodec !== "none"
+      )
+      .sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
+    formats.find((f) => f.ext === "mp4") || // Fallback to any MP4
+    formats[0]
+  ); // Last resort
 }
 
 function generateId() {
@@ -88,22 +97,23 @@ function generateId() {
 }
 
 // Health check endpoint
-app.get('/health', (req, res) => {
-  res.send({ status: 'ok', uptime: process.uptime() });
+app.get("/health", (req, res) => {
+  res.send({ status: "ok", uptime: process.uptime() });
 });
 
-app.get('/extract', async (req, res) => {
+app.get("/extract", async (req, res) => {
   const videoUrl = req.query.url;
-  
+
   if (!videoUrl) {
-    return res.status(400).json({ error: 'URL query parameter is required' });
+    return res.status(400).json({ error: "URL query parameter is required" });
   }
 
   try {
     const platform = detectPlatform(videoUrl);
     if (!platform) {
-      return res.status(400).json({ 
-        error: 'Unsupported platform. Supported: YouTube, Instagram, TikTok, Facebook' 
+      return res.status(400).json({
+        error:
+          "Unsupported platform. Supported: YouTube, Instagram, TikTok, Facebook",
       });
     }
 
@@ -115,31 +125,31 @@ app.get('/extract', async (req, res) => {
     }
 
     console.log(`📥 Extracting ${platform} metadata...`);
-    
+
     // Build args with platform-specific options
     const config = PLATFORM_CONFIG[platform];
     const args = [
       videoUrl,
-      '--dump-json',
-      '--no-warnings',
-      ...config.extraArgs
+      "--dump-json",
+      "--no-warnings",
+      ...config.extraArgs,
     ];
 
     // Fetch metadata using execPromise for better control
     const stdout = await ytdlpWrap.execPromise(args);
     const metadata = JSON.parse(stdout);
-    
+
     const bestFormat = getBestFormat(metadata.formats || []);
 
     if (!bestFormat) {
-      return res.status(500).json({ error: 'No suitable format found' });
+      return res.status(500).json({ error: "No suitable format found" });
     }
 
     const videoId = metadata.id || metadata.video_id || generateId();
-    
+
     const response = {
-      title: metadata.title || 'Unknown Title',
-      author: metadata.uploader || metadata.channel || 'Unknown Author',
+      title: metadata.title || "Unknown Title",
+      author: metadata.uploader || metadata.channel || "Unknown Author",
       thumbnail: metadata.thumbnail || null,
       duration: metadata.duration || 0,
       platform: platform,
@@ -147,35 +157,35 @@ app.get('/extract', async (req, res) => {
       streamUrl: bestFormat.url,
       downloadUrl: `/download?vid=${videoId}`,
       filesize: bestFormat.filesize || bestFormat.filesize_approx || null,
-      resolution: `${bestFormat.height || 'unknown'}p`,
-      format: bestFormat.ext || 'mp4'
+      resolution: `${bestFormat.height || "unknown"}p`,
+      format: bestFormat.ext || "mp4",
     };
 
     setCached(videoUrl, response);
     res.json(response);
 
     // Pre-download in background (non-blocking)
-    predownloadVideo(videoUrl, videoId, config).catch(err => 
+    predownloadVideo(videoUrl, videoId, config).catch((err) =>
       console.error(`Background download failed for ${videoId}:`, err.message)
     );
-
   } catch (error) {
-    console.error('Extract error:', error);
-    
+    console.error("Extract error:", error);
+
     // Provide more helpful error messages
-    let errorMsg = 'Failed to fetch video information';
-    if (error.message.includes('bot')) {
-      errorMsg = 'YouTube bot detection triggered. Try using cookies or a different video.';
-    } else if (error.message.includes('Sign in')) {
-      errorMsg = 'Video requires authentication or may be age-restricted.';
-    } else if (error.message.includes('Private video')) {
-      errorMsg = 'This video is private and cannot be accessed.';
+    let errorMsg = "Failed to fetch video information";
+    if (error.message.includes("bot")) {
+      errorMsg =
+        "YouTube bot detection triggered. Try using cookies or a different video.";
+    } else if (error.message.includes("Sign in")) {
+      errorMsg = "Video requires authentication or may be age-restricted.";
+    } else if (error.message.includes("Private video")) {
+      errorMsg = "This video is private and cannot be accessed.";
     }
-    
-    res.status(500).json({ 
-      error: errorMsg, 
+
+    res.status(500).json({
+      error: errorMsg,
       details: error.message,
-      platform: detectPlatform(videoUrl)
+      platform: detectPlatform(videoUrl),
     });
   }
 });
@@ -183,7 +193,7 @@ app.get('/extract', async (req, res) => {
 // Background downloader (non-blocking)
 async function predownloadVideo(videoUrl, videoId, platformConfig) {
   const filePath = path.join(downloadDir, `${videoId}.mp4`);
-  
+
   try {
     // Check if already exists
     const exists = await fs.stat(filePath).catch(() => null);
@@ -193,18 +203,20 @@ async function predownloadVideo(videoUrl, videoId, platformConfig) {
     }
 
     console.log(`⬇️ Starting background download: ${videoId}`);
-    
+
     const args = [
       videoUrl,
-      '-f', platformConfig.format,
-      '-o', filePath,
-      '--quiet',
-      '--no-warnings',
-      ...platformConfig.extraArgs
+      "-f",
+      platformConfig.format || "bestvideo+bestaudio/best",
+      "-o",
+      filePath,
+      "--quiet",
+      "--no-warnings",
+      ...platformConfig.extraArgs,
     ];
 
     await ytdlpWrap.execPromise(args);
-    
+
     console.log(`✅ Download complete: ${videoId}`);
   } catch (error) {
     console.error(`❌ Download error for ${videoId}:`, error.message);
@@ -212,46 +224,49 @@ async function predownloadVideo(videoUrl, videoId, platformConfig) {
 }
 
 // Serve downloaded files
-app.get('/download', async (req, res) => {
+app.get("/download", async (req, res) => {
   const videoId = req.query.vid;
-  
+
   if (!videoId) {
-    return res.status(400).json({ error: 'vid query parameter required' });
+    return res.status(400).json({ error: "vid query parameter required" });
   }
 
   const filePath = path.join(downloadDir, `${videoId}.mp4`);
 
   try {
     const stat = await fs.stat(filePath);
-    
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', stat.size);
-    res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp4"`);
-    
-    const stream = require('fs').createReadStream(filePath);
+
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Length", stat.size);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${videoId}.mp4"`
+    );
+
+    const stream = require("fs").createReadStream(filePath);
     stream.pipe(res);
-    
-    stream.on('error', (err) => {
-      console.error('Stream error:', err);
+
+    stream.on("error", (err) => {
+      console.error("Stream error:", err);
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Failed to stream file' });
+        res.status(500).json({ error: "Failed to stream file" });
       }
     });
   } catch (error) {
-    res.status(404).json({ 
-      error: 'Video not downloaded yet', 
-      message: 'Try again in a few moments',
-      videoId: videoId
+    res.status(404).json({
+      error: "Video not downloaded yet",
+      message: "Try again in a few moments",
+      videoId: videoId,
     });
   }
 });
 
 // Get download status
-app.get('/status', async (req, res) => {
+app.get("/status", async (req, res) => {
   const videoId = req.query.vid;
-  
+
   if (!videoId) {
-    return res.status(400).json({ error: 'vid query parameter required' });
+    return res.status(400).json({ error: "vid query parameter required" });
   }
 
   const filePath = path.join(downloadDir, `${videoId}.mp4`);
@@ -259,15 +274,15 @@ app.get('/status', async (req, res) => {
   try {
     const stat = await fs.stat(filePath);
     res.json({
-      status: 'ready',
+      status: "ready",
       size: stat.size,
-      videoId: videoId
+      videoId: videoId,
     });
   } catch (error) {
     res.json({
-      status: 'downloading',
-      message: 'File is being prepared',
-      videoId: videoId
+      status: "downloading",
+      message: "File is being prepared",
+      videoId: videoId,
     });
   }
 });
@@ -278,7 +293,7 @@ async function cleanupOldFiles() {
     const files = await fs.readdir(downloadDir);
     const now = Date.now();
     const maxAge = 24 * 3600 * 1000; // 24 hours
-    
+
     let deletedCount = 0;
     for (const file of files) {
       const filePath = path.join(downloadDir, file);
@@ -292,37 +307,32 @@ async function cleanupOldFiles() {
       console.log(`🗑️ Deleted ${deletedCount} old file(s)`);
     }
   } catch (error) {
-    console.error('Cleanup error:', error);
+    console.error("Cleanup error:", error);
   }
 }
 
 async function initializeApp() {
   try {
     // Check if yt-dlp binary exists
-    const binaryName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+    const binaryName = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
     const binaryPath = path.join(__dirname, binaryName);
-    
+
     const binaryExists = await fs.stat(binaryPath).catch(() => null);
-    
-    if (!binaryExists) {
-      console.log('📥 Downloading yt-dlp...');
-      await YTDlpWrap.downloadFromGithub(ytdlpPath);
-    } else {
-      console.log(`✅ yt-dlp binary found`);
-    }
-    
+
+    await YTDlpWrap.downloadFromGithub(ytdlpPath);
+
     // Make sure binary is executable (Unix-like systems)
-    if (process.platform !== 'win32') {
+    if (process.platform !== "win32") {
       await fs.chmod(binaryPath, 0o755).catch(() => {});
     }
-    
+
     ytdlpWrap.setBinaryPath(ytdlpPath);
     await ensureDownloadDir();
     await checkCookies();
-    
+
     // Cleanup old files on startup
     await cleanupOldFiles();
-    
+
     app.listen(port, () => {
       console.log(`🚀 Video Extractor API running on port ${port}`);
       console.log(`📺 Supported: YouTube, Instagram, TikTok, Facebook`);
@@ -336,7 +346,7 @@ async function initializeApp() {
     // Cleanup every 6 hours
     setInterval(cleanupOldFiles, 6 * 3600 * 1000);
   } catch (error) {
-    console.error('Failed to initialize app:', error);
+    console.error("Failed to initialize app:", error);
     process.exit(1);
   }
 }
