@@ -8,6 +8,7 @@ const port = process.env.PORT || 3000;
 const ytdlpPath = path.resolve(__dirname, 'yt-dlp');
 const ytdlpWrap = new YTDlpWrap();
 const downloadDir = path.resolve(__dirname, 'downloads');
+const cookiesPath = path.resolve(__dirname, 'youtube-cookies.txt');
 
 // Simple in-memory cache with TTL
 const metadataCache = new Map();
@@ -19,7 +20,8 @@ const PLATFORM_CONFIG = {
     format: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
     extraArgs: [
       '--extractor-args', 'youtube:player_client=android,web',
-      '--user-agent', 'com.google.android.youtube/19.09.37 (Linux; U; Android 13) gzip'
+      '--user-agent', 'com.google.android.youtube/19.09.37 (Linux; U; Android 13) gzip',
+      '--cookies', cookiesPath  // Add cookies support
     ]
   },
   instagram: { format: 'best', extraArgs: [] },
@@ -32,6 +34,22 @@ async function ensureDownloadDir() {
     await fs.mkdir(downloadDir, { recursive: true });
   } catch (e) {
     console.error('Failed to create download dir:', e);
+  }
+}
+
+async function checkCookies() {
+  try {
+    await fs.access(cookiesPath);
+    console.log('✅ YouTube cookies file found');
+    return true;
+  } catch {
+    console.warn('⚠️ No YouTube cookies found. YouTube downloads may fail.');
+    console.warn('   Export cookies to: youtube-cookies.txt');
+    // Remove cookies arg if file doesn't exist
+    PLATFORM_CONFIG.youtube.extraArgs = PLATFORM_CONFIG.youtube.extraArgs.filter(
+      arg => arg !== '--cookies' && arg !== cookiesPath
+    );
+    return false;
   }
 }
 
@@ -300,6 +318,7 @@ async function initializeApp() {
     
     ytdlpWrap.setBinaryPath(ytdlpPath);
     await ensureDownloadDir();
+    await checkCookies();
     
     // Cleanup old files on startup
     await cleanupOldFiles();
