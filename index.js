@@ -13,6 +13,7 @@ const cookiesPath = path.resolve(__dirname, "youtube-cookies.txt");
 
 // Simple metadata cache (no URLs - they expire)
 const metadataCache = new Map();
+const urlToIdCache = new Map(); // Map videoId back to URL for downloads
 const CACHE_TTL = 1800000; // 30 minutes (shorter for metadata)
 
 // Simplified platform config
@@ -96,7 +97,7 @@ app.get("/version", async (req, res) => {
   }
 });
 
-// Extract metadata only (no stream URLs)
+// Extract metadata with stream URLs
 app.get("/extract", async (req, res) => {
   const videoUrl = req.query.url;
 
@@ -124,29 +125,64 @@ app.get("/extract", async (req, res) => {
     const config = PLATFORM_CONFIG[platform];
     const args = [
       videoUrl,
+      "-f", config.format,
       "--dump-json",
       "--no-warnings",
-      "--skip-download",
       ...config.extraArgs,
     ];
 
     const stdout = await ytdlpWrap.execPromise(args);
     const metadata = JSON.parse(stdout);
 
+    // Get the selected format info
+    let selectedFormat = null;
+    let streamUrl = null;
+    let filesize = null;
+    let resolution = "unknown";
+
+    // Check if this is a merged format (requested_formats exists)
+    if (metadata.requested_formats && metadata.requested_formats.length > 0) {
+      // For merged formats, get video component for quality info
+      const videoFormat = metadata.requested_formats.find(f => f.vcodec && f.vcodec !== "none");
+      const audioFormat = metadata.requested_formats.find(f => f.acodec && f.acodec !== "none");
+      
+      selectedFormat = videoFormat || metadata.requested_formats[0];
+      streamUrl = metadata.url || selectedFormat?.url || null;
+      
+      // Sum filesizes if both video and audio present
+      filesize = (videoFormat?.filesize || videoFormat?.filesize_approx || 0) + 
+                 (audioFormat?.filesize || audioFormat?.filesize_approx || 0) || null;
+      
+      resolution = videoFormat?.height ? `${videoFormat.height}p` : "unknown";
+    } else {
+      // Single format
+      selectedFormat = metadata;
+      streamUrl = metadata.url || null;
+      filesize = metadata.filesize || metadata.filesize_approx || null;
+      resolution = metadata.height ? `${metadata.height}p` : "unknown";
+    }
+
+    const videoId = metadata.id || metadata.video_id || `vid_${Date.now()}`;
+
     const response = {
       title: metadata.title || "Unknown Title",
-      author: metadata.uploader || metadata.channel || "Unknown Author",
+      author: metadata.uploader || metadata.channel || metadata.uploader_id || "Unknown Author",
       thumbnail: metadata.thumbnail || null,
       duration: metadata.duration || 0,
       platform: platform,
-      videoId: metadata.id || metadata.video_id || `vid_${Date.now()}`,
-      // Pass original URL for download (don't cache stream URLs)
-      downloadUrl: `/download?url=${encodeURIComponent(videoUrl)}`,
-      views: metadata.view_count || null,
-      uploadDate: metadata.upload_date || null,
+      videoId: videoId,
+      streamUrl: streamUrl,
+      downloadUrl: `/download?vid=${videoId}`,
+      filesize: filesize,
+      resolution: resolution,
+      format: metadata.ext || "mp4",
     };
 
     setCached(videoUrl, response);
+    
+    // Store videoId to URL mapping for downloads
+    urlToIdCache.set(videoId, videoUrl);
+    
     res.json(response);
   } catch (error) {
     console.error("Extract error:", error.message);
@@ -170,21 +206,29 @@ app.get("/extract", async (req, res) => {
   }
 });
 
-// Stream video directly to client
+// Stream video directly to client using videoId
 app.get("/download", async (req, res) => {
-  const videoUrl = req.query.url;
+  const videoId = req.query.vid;
 
-  if (!videoUrl) {
-    return res.status(400).json({ error: "url query parameter required" });
+  if (!videoId) {
+    return res.status(400).json({ error: "vid query parameter required" });
   }
 
   try {
-    const platform = detectPlatform(videoUrl);
-    if (!platform) {
-      return res.status(400).json({ error: "Unsupported platform" });
+    // Get URL from videoId cache
+    const videoUrl = urlToIdCache.get(videoId);
+
+    if (!videoUrl) {
+      return res.status(404).json({ 
+        error: "Video not found. Please call /extract first to get video metadata.",
+        videoId: videoId 
+      });
     }
 
-    console.log(`⬇️  Streaming ${platform} video...`);
+    const platform = detectPlatform(videoUrl);
+    const cachedData = getCached(videoUrl);
+    
+    console.log(`⬇️  Streaming ${platform} video: ${videoId}`);
 
     const config = PLATFORM_CONFIG[platform];
     const args = [
@@ -196,16 +240,7 @@ app.get("/download", async (req, res) => {
       ...config.extraArgs,
     ];
 
-    // Get video info for filename
-    let filename = "video.mp4";
-    try {
-      const infoArgs = [videoUrl, "--dump-json", "--skip-download", "--no-warnings"];
-      const infoOutput = await ytdlpWrap.execPromise(infoArgs);
-      const info = JSON.parse(infoOutput);
-      filename = `${(info.title || "video").replace(/[^a-z0-9]/gi, "_").substring(0, 50)}.mp4`;
-    } catch (e) {
-      console.warn("Could not fetch title for filename:", e.message);
-    }
+    const filename = `${(cachedData?.title || "video").replace(/[^a-z0-9]/gi, "_").substring(0, 50)}.mp4`;
 
     // Set headers
     res.setHeader("Content-Type", "video/mp4");
@@ -227,7 +262,6 @@ app.get("/download", async (req, res) => {
 
     ytdlpProcess.stderr.on("data", (data) => {
       const errorMsg = data.toString();
-      // Only log actual errors, not progress
       if (errorMsg.includes("ERROR") || errorMsg.includes("WARNING")) {
         console.error("yt-dlp stderr:", errorMsg);
       }
