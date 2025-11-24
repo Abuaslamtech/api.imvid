@@ -5,53 +5,50 @@ const fs = require("fs").promises;
 const app = express();
 const port = process.env.PORT || 3000;
 
-const ytdlpPath = path.resolve(__dirname, "yt-dlp");
+// Fix: Use consistent binary naming
+const binaryName = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
+const ytdlpPath = path.resolve(__dirname, binaryName);
 const ytdlpWrap = new YTDlpWrap();
-const downloadDir = path.resolve(__dirname, "downloads");
 const cookiesPath = path.resolve(__dirname, "youtube-cookies.txt");
 
-// Simple in-memory cache with TTL
+// Simple metadata cache (no URLs - they expire)
 const metadataCache = new Map();
-const CACHE_TTL = 3600000; // 1 hour
+const CACHE_TTL = 1800000; // 30 minutes (shorter for metadata)
 
-// Updated platform config with better YouTube handling
+// Simplified platform config
 const PLATFORM_CONFIG = {
   youtube: {
+    format: "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
     extraArgs: [
-      "--extractor-args",
-      "youtube:player_client=android,web,ios",
-      "--user-agent",
-      "com.google.android.youtube/19.09.37 (Linux; U; Android 13) gzip",
       "--no-check-certificate",
-      "--extractor-retries",
-      "3",
-      "--fragment-retries",
-      "3",
+      "--extractor-retries", "5",
+      "--fragment-retries", "5",
+      "--retry-sleep", "3",
     ],
   },
-  instagram: { format: "best", extraArgs: [] },
-  tiktok: { format: "best", extraArgs: [] },
-  facebook: { format: "best", extraArgs: [] },
+  instagram: {
+    format: "best",
+    extraArgs: [],
+  },
+  tiktok: {
+    format: "best",
+    extraArgs: [],
+  },
+  facebook: {
+    format: "best",
+    extraArgs: [],
+  },
 };
-
-async function ensureDownloadDir() {
-  try {
-    await fs.mkdir(downloadDir, { recursive: true });
-  } catch (e) {
-    console.error("Failed to create download dir:", e);
-  }
-}
 
 async function checkCookies() {
   try {
     await fs.access(cookiesPath);
     console.log("✅ YouTube cookies file found");
-    // Add cookies to YouTube config
     PLATFORM_CONFIG.youtube.extraArgs.push("--cookies", cookiesPath);
     return true;
   } catch {
-    console.warn("⚠️ No YouTube cookies found. YouTube downloads may fail for age-restricted/private videos.");
-    console.warn("   To fix: Export cookies to youtube-cookies.txt");
+    console.warn("⚠️  No YouTube cookies found");
+    console.warn("   For age-restricted videos, export cookies to youtube-cookies.txt");
     return false;
   }
 }
@@ -60,8 +57,7 @@ function detectPlatform(url) {
   if (url.includes("youtube.com") || url.includes("youtu.be")) return "youtube";
   if (url.includes("instagram.com")) return "instagram";
   if (url.includes("tiktok.com")) return "tiktok";
-  if (url.includes("facebook.com") || url.includes("fb.watch"))
-    return "facebook";
+  if (url.includes("facebook.com") || url.includes("fb.watch")) return "facebook";
   return null;
 }
 
@@ -78,23 +74,6 @@ function setCached(key, data) {
   metadataCache.set(key, { data, time: Date.now() });
 }
 
-function getBestFormat(formats) {
-  // Find best MP4 format with both audio and video
-  return (
-    formats
-      .filter(
-        (f) => f.ext === "mp4" && f.acodec !== "none" && f.vcodec !== "none"
-      )
-      .sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
-    formats.find((f) => f.ext === "mp4") || // Fallback to any MP4
-    formats[0]
-  ); // Last resort
-}
-
-function generateId() {
-  return `vid_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-}
-
 // Health check endpoint
 app.get("/health", (req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
@@ -104,19 +83,20 @@ app.get("/health", (req, res) => {
 app.get("/version", async (req, res) => {
   try {
     const version = await ytdlpWrap.execPromise(["--version"]);
-    res.json({ 
+    res.json({
       status: "ok",
       ytdlpVersion: version.trim(),
-      apiVersion: "1.0.0"
+      apiVersion: "2.0.0",
     });
   } catch (error) {
-    res.status(500).json({ 
+    res.status(500).json({
       error: "Could not get yt-dlp version",
-      details: error.message 
+      details: error.message,
     });
   }
 });
 
+// Extract metadata only (no stream URLs)
 app.get("/extract", async (req, res) => {
   const videoUrl = req.query.url;
 
@@ -128,40 +108,30 @@ app.get("/extract", async (req, res) => {
     const platform = detectPlatform(videoUrl);
     if (!platform) {
       return res.status(400).json({
-        error:
-          "Unsupported platform. Supported: YouTube, Instagram, TikTok, Facebook",
+        error: "Unsupported platform. Supported: YouTube, Instagram, TikTok, Facebook",
       });
     }
 
     // Check cache first
     const cached = getCached(videoUrl);
     if (cached) {
-      console.log(`✅ Serving ${platform} from cache`);
+      console.log(`✅ Serving ${platform} metadata from cache`);
       return res.json(cached);
     }
 
     console.log(`📥 Extracting ${platform} metadata...`);
 
-    // Build args with platform-specific options
     const config = PLATFORM_CONFIG[platform];
     const args = [
       videoUrl,
       "--dump-json",
       "--no-warnings",
+      "--skip-download",
       ...config.extraArgs,
     ];
 
-    // Fetch metadata using execPromise for better control
     const stdout = await ytdlpWrap.execPromise(args);
     const metadata = JSON.parse(stdout);
-
-    const bestFormat = getBestFormat(metadata.formats || []);
-
-    if (!bestFormat) {
-      return res.status(500).json({ error: "No suitable format found" });
-    }
-
-    const videoId = metadata.id || metadata.video_id || generateId();
 
     const response = {
       title: metadata.title || "Unknown Title",
@@ -169,35 +139,27 @@ app.get("/extract", async (req, res) => {
       thumbnail: metadata.thumbnail || null,
       duration: metadata.duration || 0,
       platform: platform,
-      videoId: videoId,
-      streamUrl: bestFormat.url,
-      downloadUrl: `/download?vid=${videoId}`,
-      filesize: bestFormat.filesize || bestFormat.filesize_approx || null,
-      resolution: `${bestFormat.height || "unknown"}p`,
-      format: bestFormat.ext || "mp4",
+      videoId: metadata.id || metadata.video_id || `vid_${Date.now()}`,
+      // Pass original URL for download (don't cache stream URLs)
+      downloadUrl: `/download?url=${encodeURIComponent(videoUrl)}`,
+      views: metadata.view_count || null,
+      uploadDate: metadata.upload_date || null,
     };
 
     setCached(videoUrl, response);
     res.json(response);
-
-    // Pre-download in background (non-blocking)
-    predownloadVideo(videoUrl, videoId, config).catch((err) =>
-      console.error(`Background download failed for ${videoId}:`, err.message)
-    );
   } catch (error) {
-    console.error("Extract error:", error);
+    console.error("Extract error:", error.message);
 
-    // Provide more helpful error messages
     let errorMsg = "Failed to fetch video information";
-    if (error.message.includes("bot")) {
-      errorMsg =
-        "YouTube bot detection triggered. Try using cookies or wait a moment.";
-    } else if (error.message.includes("Sign in")) {
-      errorMsg = "Video requires authentication or may be age-restricted. Add cookies file.";
+    if (error.message.includes("Sign in") || error.message.includes("bot")) {
+      errorMsg = "Video may be age-restricted or require authentication. Add cookies file.";
     } else if (error.message.includes("Private video")) {
       errorMsg = "This video is private and cannot be accessed.";
-    } else if (error.message.includes("Video unavailable")) {
+    } else if (error.message.includes("Video unavailable") || error.message.includes("not available")) {
       errorMsg = "Video is unavailable or has been removed.";
+    } else if (error.message.includes("429") || error.message.includes("Too Many Requests")) {
+      errorMsg = "Rate limited. Please try again in a few moments.";
     }
 
     res.status(500).json({
@@ -208,190 +170,220 @@ app.get("/extract", async (req, res) => {
   }
 });
 
-// Background downloader (non-blocking)
-async function predownloadVideo(videoUrl, videoId, platformConfig) {
-  const filePath = path.join(downloadDir, `${videoId}.mp4`);
+// Stream video directly to client
+app.get("/download", async (req, res) => {
+  const videoUrl = req.query.url;
+
+  if (!videoUrl) {
+    return res.status(400).json({ error: "url query parameter required" });
+  }
 
   try {
-    // Check if already exists
-    const exists = await fs.stat(filePath).catch(() => null);
-    if (exists) {
-      console.log(`✅ Video ${videoId} already downloaded`);
-      return;
+    const platform = detectPlatform(videoUrl);
+    if (!platform) {
+      return res.status(400).json({ error: "Unsupported platform" });
     }
 
-    console.log(`⬇️ Starting background download: ${videoId}`);
+    console.log(`⬇️  Streaming ${platform} video...`);
 
+    const config = PLATFORM_CONFIG[platform];
     const args = [
       videoUrl,
-      "-f",
-      platformConfig.format || "bestvideo+bestaudio/best",
-      "-o",
-      filePath,
-      "--quiet",
+      "-f", config.format,
+      "-o", "-", // Output to stdout
       "--no-warnings",
-      ...platformConfig.extraArgs,
+      "--quiet",
+      ...config.extraArgs,
     ];
 
-    await ytdlpWrap.execPromise(args);
+    // Get video info for filename
+    let filename = "video.mp4";
+    try {
+      const infoArgs = [videoUrl, "--dump-json", "--skip-download", "--no-warnings"];
+      const infoOutput = await ytdlpWrap.execPromise(infoArgs);
+      const info = JSON.parse(infoOutput);
+      filename = `${(info.title || "video").replace(/[^a-z0-9]/gi, "_").substring(0, 50)}.mp4`;
+    } catch (e) {
+      console.warn("Could not fetch title for filename:", e.message);
+    }
 
-    console.log(`✅ Download complete: ${videoId}`);
-  } catch (error) {
-    console.error(`❌ Download error for ${videoId}:`, error.message);
-  }
-}
-
-// Serve downloaded files
-app.get("/download", async (req, res) => {
-  const videoId = req.query.vid;
-
-  if (!videoId) {
-    return res.status(400).json({ error: "vid query parameter required" });
-  }
-
-  const filePath = path.join(downloadDir, `${videoId}.mp4`);
-
-  try {
-    const stat = await fs.stat(filePath);
-
+    // Set headers
     res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Length", stat.size);
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${videoId}.mp4"`
-    );
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
 
-    const stream = require("fs").createReadStream(filePath);
-    stream.pipe(res);
+    // Start yt-dlp process
+    const ytdlpProcess = ytdlpWrap.exec(args);
 
-    stream.on("error", (err) => {
-      console.error("Stream error:", err);
+    // Pipe stdout to response
+    ytdlpProcess.stdout.pipe(res);
+
+    // Handle errors
+    ytdlpProcess.on("error", (error) => {
+      console.error("Download process error:", error.message);
       if (!res.headersSent) {
-        res.status(500).json({ error: "Failed to stream file" });
+        res.status(500).json({ error: "Download failed", details: error.message });
       }
     });
-  } catch (error) {
-    res.status(404).json({
-      error: "Video not downloaded yet",
-      message: "Try again in a few moments",
-      videoId: videoId,
+
+    ytdlpProcess.stderr.on("data", (data) => {
+      const errorMsg = data.toString();
+      // Only log actual errors, not progress
+      if (errorMsg.includes("ERROR") || errorMsg.includes("WARNING")) {
+        console.error("yt-dlp stderr:", errorMsg);
+      }
     });
+
+    ytdlpProcess.on("close", (code) => {
+      if (code !== 0) {
+        console.error(`yt-dlp process exited with code ${code}`);
+        if (!res.headersSent) {
+          res.status(500).json({ error: "Download failed" });
+        }
+      } else {
+        console.log("✅ Stream completed successfully");
+      }
+    });
+
+    // Handle client disconnect
+    req.on("close", () => {
+      if (!ytdlpProcess.killed) {
+        console.log("Client disconnected, killing yt-dlp process");
+        ytdlpProcess.kill();
+      }
+    });
+
+  } catch (error) {
+    console.error("Download error:", error.message);
+    
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: "Failed to download video",
+        details: error.message,
+      });
+    }
   }
 });
 
-// Get download status
-app.get("/status", async (req, res) => {
-  const videoId = req.query.vid;
+// Quick info endpoint (faster than extract, less data)
+app.get("/info", async (req, res) => {
+  const videoUrl = req.query.url;
 
-  if (!videoId) {
-    return res.status(400).json({ error: "vid query parameter required" });
+  if (!videoUrl) {
+    return res.status(400).json({ error: "URL query parameter is required" });
   }
 
-  const filePath = path.join(downloadDir, `${videoId}.mp4`);
-
   try {
-    const stat = await fs.stat(filePath);
+    const args = [
+      videoUrl,
+      "--get-title",
+      "--get-duration",
+      "--get-thumbnail",
+      "--no-warnings",
+    ];
+
+    const output = await ytdlpWrap.execPromise(args);
+    const lines = output.trim().split("\n");
+
     res.json({
-      status: "ready",
-      size: stat.size,
-      videoId: videoId,
+      title: lines[0] || "Unknown",
+      duration: lines[1] || "Unknown",
+      thumbnail: lines[2] || null,
     });
   } catch (error) {
-    res.json({
-      status: "downloading",
-      message: "File is being prepared",
-      videoId: videoId,
+    res.status(500).json({
+      error: "Failed to fetch video info",
+      details: error.message,
     });
   }
 });
-
-// Cleanup old files (runs on startup and every 6 hours)
-async function cleanupOldFiles() {
-  try {
-    const files = await fs.readdir(downloadDir);
-    const now = Date.now();
-    const maxAge = 24 * 3600 * 1000; // 24 hours
-
-    let deletedCount = 0;
-    for (const file of files) {
-      const filePath = path.join(downloadDir, file);
-      const stat = await fs.stat(filePath);
-      if (now - stat.mtimeMs > maxAge) {
-        await fs.unlink(filePath);
-        deletedCount++;
-      }
-    }
-    if (deletedCount > 0) {
-      console.log(`🗑️ Deleted ${deletedCount} old file(s)`);
-    }
-  } catch (error) {
-    console.error("Cleanup error:", error);
-  }
-}
 
 async function initializeApp() {
   try {
-    const binaryName = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
-    const binaryPath = path.join(__dirname, binaryName);
+    console.log("🔧 Initializing Video Extractor API...");
 
-    // ALWAYS download latest version to handle YouTube policy changes
+    // Always download latest yt-dlp for YouTube compatibility
     console.log("⬇️  Downloading latest yt-dlp binary...");
     try {
       await YTDlpWrap.downloadFromGithub(
         ytdlpPath,
         process.env.GITHUB_TOKEN || undefined
       );
-      console.log("✅ yt-dlp updated successfully");
+      console.log("✅ yt-dlp downloaded successfully");
     } catch (downloadError) {
       console.error("❌ Failed to download yt-dlp:", downloadError.message);
-      
-      // Check if we have existing binary as fallback
-      const binaryExists = await fs.stat(binaryPath).catch(() => null);
-      if (binaryExists) {
+
+      // Check for existing binary
+      try {
+        await fs.access(ytdlpPath);
         console.warn("⚠️  Using existing yt-dlp binary (may be outdated)");
-        console.warn("⚠️  Set GITHUB_TOKEN environment variable to avoid rate limits");
-      } else {
+        console.warn("⚠️  YouTube downloads may fail with old versions");
+        console.warn("⚠️  Set GITHUB_TOKEN env var to avoid rate limits");
+      } catch {
         throw new Error(
-          "Failed to download yt-dlp and no existing binary found. " +
-          "Please set GITHUB_TOKEN environment variable or wait for GitHub rate limit reset."
+          "No yt-dlp binary found and download failed.\n" +
+          "Solutions:\n" +
+          "1. Set GITHUB_TOKEN environment variable\n" +
+          "2. Download yt-dlp manually to: " + ytdlpPath + "\n" +
+          "3. Wait for GitHub rate limit reset (1 hour)"
         );
       }
     }
 
     // Make executable on Unix
     if (process.platform !== "win32") {
-      await fs.chmod(binaryPath, 0o755).catch(() => {});
+      await fs.chmod(ytdlpPath, 0o755).catch(() => {});
     }
 
+    // Set binary path
     ytdlpWrap.setBinaryPath(ytdlpPath);
-    await ensureDownloadDir();
+
+    // Verify yt-dlp works
+    try {
+      const version = await ytdlpWrap.execPromise(["--version"]);
+      console.log(`✅ yt-dlp version: ${version.trim()}`);
+    } catch (error) {
+      throw new Error(`yt-dlp binary test failed: ${error.message}`);
+    }
+
+    // Check for cookies
     await checkCookies();
 
-    // Cleanup old files on startup
-    await cleanupOldFiles();
-
+    // Start server
     app.listen(port, () => {
-      console.log(`🚀 Video Extractor API running on port ${port}`);
+      console.log(`\n🚀 Video Extractor API running on port ${port}`);
       console.log(`📺 Supported: YouTube, Instagram, TikTok, Facebook`);
-      console.log(`\nEndpoints:`);
-      console.log(`  GET /health - Health check`);
-      console.log(`  GET /version - Check yt-dlp version`);
-      console.log(`  GET /extract?url={videoUrl} - Extract metadata`);
-      console.log(`  GET /download?vid={videoId} - Download video`);
-      console.log(`  GET /status?vid={videoId} - Check download status`);
-      console.log(`\n💡 Tip: Set GITHUB_TOKEN env var to avoid rate limits`);
+      console.log(`\n📍 Endpoints:`);
+      console.log(`   GET /health              - Health check`);
+      console.log(`   GET /version             - yt-dlp version info`);
+      console.log(`   GET /extract?url={url}   - Full video metadata`);
+      console.log(`   GET /info?url={url}      - Quick info only`);
+      console.log(`   GET /download?url={url}  - Stream/download video`);
+      console.log(`\n💡 Tips:`);
+      console.log(`   - Set GITHUB_TOKEN to avoid download rate limits`);
+      console.log(`   - Add youtube-cookies.txt for restricted videos`);
+      console.log(`   - Videos stream directly (no disk storage needed)\n`);
     });
 
-    // Cleanup every 6 hours
-    setInterval(cleanupOldFiles, 6 * 3600 * 1000);
   } catch (error) {
-    console.error("❌ Failed to initialize app:", error.message);
-    console.error("\nTroubleshooting:");
-    console.error("1. Set GITHUB_TOKEN environment variable");
-    console.error("2. Wait for GitHub rate limit reset");
-    console.error("3. Check your internet connection");
+    console.error("\n❌ Failed to initialize app:", error.message);
+    console.error("\n🔍 Troubleshooting:");
+    console.error("   1. Check internet connection");
+    console.error("   2. Set GITHUB_TOKEN environment variable");
+    console.error("   3. Manually download yt-dlp to:", ytdlpPath);
+    console.error("   4. Wait for GitHub rate limit reset\n");
     process.exit(1);
   }
 }
+
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  console.log("\n🛑 Received SIGTERM, shutting down gracefully...");
+  process.exit(0);
+});
+
+process.on("SIGINT", () => {
+  console.log("\n🛑 Received SIGINT, shutting down gracefully...");
+  process.exit(0);
+});
 
 initializeApp();
