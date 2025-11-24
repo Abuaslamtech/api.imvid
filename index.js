@@ -19,11 +19,14 @@ const PLATFORM_CONFIG = {
   youtube: {
     extraArgs: [
       "--extractor-args",
-      "youtube:player_client=android,web",
+      "youtube:player_client=android,web,ios",
       "--user-agent",
       "com.google.android.youtube/19.09.37 (Linux; U; Android 13) gzip",
-      "--cookies",
-      cookiesPath, // Add cookies support
+      "--no-check-certificate",
+      "--extractor-retries",
+      "3",
+      "--fragment-retries",
+      "3",
     ],
   },
   instagram: { format: "best", extraArgs: [] },
@@ -43,16 +46,12 @@ async function checkCookies() {
   try {
     await fs.access(cookiesPath);
     console.log("✅ YouTube cookies file found");
+    // Add cookies to YouTube config
+    PLATFORM_CONFIG.youtube.extraArgs.push("--cookies", cookiesPath);
     return true;
   } catch {
-    console.warn("⚠️ No YouTube cookies found. YouTube downloads may fail.");
-    console.warn("   Export cookies to: youtube-cookies.txt");
-    // Remove cookies arg if file doesn't exist
-    const i = PLATFORM_CONFIG.youtube.extraArgs.indexOf("--cookies");
-    if (i !== -1) {
-      PLATFORM_CONFIG.youtube.extraArgs.splice(i, 2); // remove --cookies & path together
-    }
-
+    console.warn("⚠️ No YouTube cookies found. YouTube downloads may fail for age-restricted/private videos.");
+    console.warn("   To fix: Export cookies to youtube-cookies.txt");
     return false;
   }
 }
@@ -98,7 +97,24 @@ function generateId() {
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  res.send({ status: "ok", uptime: process.uptime() });
+  res.json({ status: "ok", uptime: process.uptime() });
+});
+
+// Version check endpoint
+app.get("/version", async (req, res) => {
+  try {
+    const version = await ytdlpWrap.execPromise(["--version"]);
+    res.json({ 
+      status: "ok",
+      ytdlpVersion: version.trim(),
+      apiVersion: "1.0.0"
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      error: "Could not get yt-dlp version",
+      details: error.message 
+    });
+  }
 });
 
 app.get("/extract", async (req, res) => {
@@ -175,11 +191,13 @@ app.get("/extract", async (req, res) => {
     let errorMsg = "Failed to fetch video information";
     if (error.message.includes("bot")) {
       errorMsg =
-        "YouTube bot detection triggered. Try using cookies or a different video.";
+        "YouTube bot detection triggered. Try using cookies or wait a moment.";
     } else if (error.message.includes("Sign in")) {
-      errorMsg = "Video requires authentication or may be age-restricted.";
+      errorMsg = "Video requires authentication or may be age-restricted. Add cookies file.";
     } else if (error.message.includes("Private video")) {
       errorMsg = "This video is private and cannot be accessed.";
+    } else if (error.message.includes("Video unavailable")) {
+      errorMsg = "Video is unavailable or has been removed.";
     }
 
     res.status(500).json({
@@ -313,15 +331,34 @@ async function cleanupOldFiles() {
 
 async function initializeApp() {
   try {
-    // Check if yt-dlp binary exists
     const binaryName = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
     const binaryPath = path.join(__dirname, binaryName);
 
-    const binaryExists = await fs.stat(binaryPath).catch(() => null);
+    // ALWAYS download latest version to handle YouTube policy changes
+    console.log("⬇️  Downloading latest yt-dlp binary...");
+    try {
+      await YTDlpWrap.downloadFromGithub(
+        ytdlpPath,
+        process.env.GITHUB_TOKEN || undefined
+      );
+      console.log("✅ yt-dlp updated successfully");
+    } catch (downloadError) {
+      console.error("❌ Failed to download yt-dlp:", downloadError.message);
+      
+      // Check if we have existing binary as fallback
+      const binaryExists = await fs.stat(binaryPath).catch(() => null);
+      if (binaryExists) {
+        console.warn("⚠️  Using existing yt-dlp binary (may be outdated)");
+        console.warn("⚠️  Set GITHUB_TOKEN environment variable to avoid rate limits");
+      } else {
+        throw new Error(
+          "Failed to download yt-dlp and no existing binary found. " +
+          "Please set GITHUB_TOKEN environment variable or wait for GitHub rate limit reset."
+        );
+      }
+    }
 
-    await YTDlpWrap.downloadFromGithub(ytdlpPath);
-
-    // Make sure binary is executable (Unix-like systems)
+    // Make executable on Unix
     if (process.platform !== "win32") {
       await fs.chmod(binaryPath, 0o755).catch(() => {});
     }
@@ -338,15 +375,21 @@ async function initializeApp() {
       console.log(`📺 Supported: YouTube, Instagram, TikTok, Facebook`);
       console.log(`\nEndpoints:`);
       console.log(`  GET /health - Health check`);
+      console.log(`  GET /version - Check yt-dlp version`);
       console.log(`  GET /extract?url={videoUrl} - Extract metadata`);
       console.log(`  GET /download?vid={videoId} - Download video`);
       console.log(`  GET /status?vid={videoId} - Check download status`);
+      console.log(`\n💡 Tip: Set GITHUB_TOKEN env var to avoid rate limits`);
     });
 
     // Cleanup every 6 hours
     setInterval(cleanupOldFiles, 6 * 3600 * 1000);
   } catch (error) {
-    console.error("Failed to initialize app:", error);
+    console.error("❌ Failed to initialize app:", error.message);
+    console.error("\nTroubleshooting:");
+    console.error("1. Set GITHUB_TOKEN environment variable");
+    console.error("2. Wait for GitHub rate limit reset");
+    console.error("3. Check your internet connection");
     process.exit(1);
   }
 }
