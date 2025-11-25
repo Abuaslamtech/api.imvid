@@ -2,6 +2,7 @@ const express = require("express");
 const YTDlpWrap = require("yt-dlp-wrap").default;
 const path = require("path");
 const fs = require("fs").promises;
+const https = require("https");
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -52,6 +53,61 @@ async function checkCookies() {
     console.warn("   For age-restricted videos, export cookies to youtube-cookies.txt");
     return false;
   }
+}
+
+// Alternative download method using direct HTTPS request
+async function downloadBinaryDirect(downloadPath) {
+  const url = process.platform === "win32" 
+    ? "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+    : "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+
+  return new Promise((resolve, reject) => {
+    console.log(`📥 Downloading from: ${url}`);
+    
+    const request = https.get(url, {
+      headers: {
+        'User-Agent': 'Node.js',
+        ...(process.env.GITHUB_TOKEN && {
+          'Authorization': `token ${process.env.GITHUB_TOKEN}`
+        })
+      }
+    }, (response) => {
+      // Handle redirects
+      if (response.statusCode === 302 || response.statusCode === 301) {
+        https.get(response.headers.location, (redirectResponse) => {
+          const chunks = [];
+          redirectResponse.on('data', (chunk) => chunks.push(chunk));
+          redirectResponse.on('end', async () => {
+            try {
+              await fs.writeFile(downloadPath, Buffer.concat(chunks), { mode: 0o755 });
+              console.log("✅ Download complete");
+              resolve();
+            } catch (err) {
+              reject(err);
+            }
+          });
+        }).on('error', reject);
+      } else {
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', async () => {
+          try {
+            await fs.writeFile(downloadPath, Buffer.concat(chunks), { mode: 0o755 });
+            console.log("✅ Download complete");
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }
+    });
+
+    request.on('error', reject);
+    request.setTimeout(30000, () => {
+      request.destroy();
+      reject(new Error('Download timeout'));
+    });
+  });
 }
 
 function detectPlatform(url) {
@@ -335,37 +391,55 @@ async function initializeApp() {
   try {
     console.log("🔧 Initializing Video Extractor API...");
 
-    // Always download latest yt-dlp for YouTube compatibility
+    // ALWAYS delete any existing binary first
+    console.log("🗑️  Cleaning up old binaries...");
+    try {
+      await fs.unlink(ytdlpPath);
+      console.log("✅ Removed old binary");
+    } catch (err) {
+      // File doesn't exist, that's fine
+      console.log("ℹ️  No existing binary to remove");
+    }
+
+    // Try downloading with yt-dlp-wrap first
     console.log("⬇️  Downloading latest yt-dlp binary...");
+    let downloadSuccess = false;
+    
     try {
       await YTDlpWrap.downloadFromGithub(
         ytdlpPath,
+        undefined, // version (latest)
+        undefined, // platform (auto-detect)
         process.env.GITHUB_TOKEN || undefined
       );
-      console.log("✅ yt-dlp downloaded successfully");
+      downloadSuccess = true;
+      console.log("✅ yt-dlp downloaded successfully via yt-dlp-wrap");
     } catch (downloadError) {
-      console.error("❌ Failed to download yt-dlp:", downloadError.message);
-
-      // Check for existing binary
+      console.warn("⚠️  yt-dlp-wrap download failed:", downloadError.message);
+      console.log("🔄 Trying alternative download method...");
+      
+      // Try direct download
       try {
-        await fs.access(ytdlpPath);
-        console.warn("⚠️  Using existing yt-dlp binary (may be outdated)");
-        console.warn("⚠️  YouTube downloads may fail with old versions");
-        console.warn("⚠️  Set GITHUB_TOKEN env var to avoid rate limits");
-      } catch {
-        throw new Error(
-          "No yt-dlp binary found and download failed.\n" +
-          "Solutions:\n" +
-          "1. Set GITHUB_TOKEN environment variable\n" +
-          "2. Download yt-dlp manually to: " + ytdlpPath + "\n" +
-          "3. Wait for GitHub rate limit reset (1 hour)"
-        );
+        await downloadBinaryDirect(ytdlpPath);
+        downloadSuccess = true;
+      } catch (directError) {
+        console.error("❌ Direct download also failed:", directError.message);
       }
+    }
+
+    if (!downloadSuccess) {
+      throw new Error(
+        "Failed to download yt-dlp binary.\n" +
+        "Solutions:\n" +
+        "1. Set GITHUB_TOKEN environment variable\n" +
+        "2. Check if GitHub API is accessible from your server\n" +
+        "3. Wait for GitHub rate limit reset (1 hour)"
+      );
     }
 
     // Make executable on Unix
     if (process.platform !== "win32") {
-      await fs.chmod(ytdlpPath, 0o755).catch(() => {});
+      await fs.chmod(ytdlpPath, 0o755);
     }
 
     // Set binary path
@@ -376,6 +450,10 @@ async function initializeApp() {
       const version = await ytdlpWrap.execPromise(["--version"]);
       console.log(`✅ yt-dlp version: ${version.trim()}`);
     } catch (error) {
+      // If binary test fails, delete it
+      try {
+        await fs.unlink(ytdlpPath);
+      } catch {}
       throw new Error(`yt-dlp binary test failed: ${error.message}`);
     }
 
@@ -391,7 +469,7 @@ async function initializeApp() {
       console.log(`   GET /version             - yt-dlp version info`);
       console.log(`   GET /extract?url={url}   - Full video metadata`);
       console.log(`   GET /info?url={url}      - Quick info only`);
-      console.log(`   GET /download?url={url}  - Stream/download video`);
+      console.log(`   GET /download?vid={vid}  - Stream/download video`);
       console.log(`\n💡 Tips:`);
       console.log(`   - Set GITHUB_TOKEN to avoid download rate limits`);
       console.log(`   - Add youtube-cookies.txt for restricted videos`);
@@ -403,7 +481,7 @@ async function initializeApp() {
     console.error("\n🔍 Troubleshooting:");
     console.error("   1. Check internet connection");
     console.error("   2. Set GITHUB_TOKEN environment variable");
-    console.error("   3. Manually download yt-dlp to:", ytdlpPath);
+    console.error("   3. Check if GitHub is accessible from your server");
     console.error("   4. Wait for GitHub rate limit reset\n");
     process.exit(1);
   }
