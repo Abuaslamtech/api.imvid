@@ -176,7 +176,7 @@ app.get("/extract", async (req, res) => {
       return res.json(cached);
     }
 
-    console.log(`📥 Extracting ${platform} metadata...`);
+    console.log(`📥 Extracting ${platform} metadata for: ${videoUrl.substring(0, 50)}...`);
 
     const config = PLATFORM_CONFIG[platform];
     const args = [
@@ -184,34 +184,59 @@ app.get("/extract", async (req, res) => {
       "-f", config.format,
       "--dump-json",
       "--no-warnings",
+      "--no-playlist",
+      "--skip-download",
       ...config.extraArgs,
     ];
 
-    const stdout = await ytdlpWrap.execPromise(args);
-    const metadata = JSON.parse(stdout);
+    console.log(`🔧 Running yt-dlp with args:`, args.join(' '));
 
-    // Get the selected format info
+    // Increase timeout to 60 seconds for slower servers
+    const stdout = await Promise.race([
+      ytdlpWrap.execPromise(args),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Extraction timeout after 60s')), 60000)
+      )
+    ]);
+
+    // Validate output
+    if (!stdout || typeof stdout !== 'string' || stdout.trim().length === 0) {
+      console.error("❌ yt-dlp returned empty output");
+      throw new Error("yt-dlp returned empty output. Video may be unavailable.");
+    }
+
+    console.log(`✅ Received ${stdout.length} bytes of data`);
+
+    // Parse JSON
+    let metadata;
+    try {
+      metadata = JSON.parse(stdout);
+    } catch (parseError) {
+      console.error("❌ JSON Parse Error:", parseError.message);
+      console.error("📄 First 300 chars:", stdout.substring(0, 300));
+      throw new Error(`Invalid JSON from yt-dlp: ${parseError.message}`);
+    }
+
+    console.log(`✅ Successfully parsed metadata for: ${metadata.title || 'Unknown'}`);
+
+    // Get the selected format info (your existing code)
     let selectedFormat = null;
     let streamUrl = null;
     let filesize = null;
     let resolution = "unknown";
 
-    // Check if this is a merged format (requested_formats exists)
     if (metadata.requested_formats && metadata.requested_formats.length > 0) {
-      // For merged formats, get video component for quality info
       const videoFormat = metadata.requested_formats.find(f => f.vcodec && f.vcodec !== "none");
       const audioFormat = metadata.requested_formats.find(f => f.acodec && f.acodec !== "none");
       
       selectedFormat = videoFormat || metadata.requested_formats[0];
       streamUrl = metadata.url || selectedFormat?.url || null;
       
-      // Sum filesizes if both video and audio present
       filesize = (videoFormat?.filesize || videoFormat?.filesize_approx || 0) + 
                  (audioFormat?.filesize || audioFormat?.filesize_approx || 0) || null;
       
       resolution = videoFormat?.height ? `${videoFormat.height}p` : "unknown";
     } else {
-      // Single format
       selectedFormat = metadata;
       streamUrl = metadata.url || null;
       filesize = metadata.filesize || metadata.filesize_approx || null;
@@ -235,29 +260,90 @@ app.get("/extract", async (req, res) => {
     };
 
     setCached(videoUrl, response);
-    
-    // Store videoId to URL mapping for downloads
     urlToIdCache.set(videoId, videoUrl);
     
+    console.log(`✅ Metadata extraction complete for: ${videoId}`);
     res.json(response);
+
   } catch (error) {
-    console.error("Extract error:", error.message);
+    console.error("❌ Extract error:", error.message);
 
     let errorMsg = "Failed to fetch video information";
-    if (error.message.includes("Sign in") || error.message.includes("bot")) {
-      errorMsg = "Video may be age-restricted or require authentication. Add cookies file.";
-    } else if (error.message.includes("Private video")) {
-      errorMsg = "This video is private and cannot be accessed.";
-    } else if (error.message.includes("Video unavailable") || error.message.includes("not available")) {
-      errorMsg = "Video is unavailable or has been removed.";
-    } else if (error.message.includes("429") || error.message.includes("Too Many Requests")) {
-      errorMsg = "Rate limited. Please try again in a few moments.";
+    let statusCode = 500;
+
+    if (error.message.includes("timeout")) {
+      errorMsg = "Request timed out. Try again or the video may be too large.";
+      statusCode = 504;
+    } else if (error.message.includes("empty output")) {
+      errorMsg = "Video unavailable or access denied.";
+      statusCode = 404;
     }
 
-    res.status(500).json({
+    res.status(statusCode).json({
       error: errorMsg,
       details: error.message,
       platform: detectPlatform(videoUrl),
+    });
+  }
+});
+
+// Debug endpoint to test yt-dlp
+app.get("/debug", async (req, res) => {
+  const testUrl = req.query.url || "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+  
+  try {
+    console.log("🔍 Testing yt-dlp with:", testUrl);
+    
+    // Test 1: Version
+    const version = await ytdlpWrap.execPromise(["--version"]);
+    console.log("✅ Version:", version.trim());
+    
+    // Test 2: Simple extraction
+    const simpleArgs = [
+      testUrl,
+      "--dump-json",
+      "--no-playlist",
+      "--skip-download"
+    ];
+    
+    const output = await Promise.race([
+      ytdlpWrap.execPromise(simpleArgs),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Test timeout')), 20000)
+      )
+    ]);
+    
+    let isValidJson = false;
+    let parsedData = null;
+    
+    try {
+      parsedData = JSON.parse(output);
+      isValidJson = true;
+    } catch (e) {
+      console.error("JSON parse failed:", e.message);
+    }
+    
+    res.json({
+      status: "ok",
+      ytdlpVersion: version.trim(),
+      binaryPath: ytdlpPath,
+      binaryExists: require('fs').existsSync(ytdlpPath),
+      testUrl: testUrl,
+      outputLength: output?.length || 0,
+      isValidJson: isValidJson,
+      videoTitle: parsedData?.title || "Parse failed",
+      outputPreview: output?.substring(0, 500) || "No output",
+      platform: process.platform,
+      node: process.version
+    });
+    
+  } catch (error) {
+    console.error("❌ Debug test failed:", error.message);
+    res.status(500).json({
+      error: error.message,
+      stack: error.stack,
+      binaryPath: ytdlpPath,
+      binaryExists: require('fs').existsSync(ytdlpPath)
     });
   }
 });
