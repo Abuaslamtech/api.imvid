@@ -198,6 +198,8 @@ app.get("/extract", async (req, res) => {
   }
 });
 
+// Replace your /download endpoint with this fixed version
+
 app.get("/download", async (req, res) => {
   const videoId = req.query.vid;
   if (!videoId) return res.status(400).json({ error: "Missing 'vid'" });
@@ -229,27 +231,53 @@ app.get("/download", async (req, res) => {
     ...platformArgs
   ];
 
-  const ytdlp = ytdlpWrap.exec(streamArgs);
+  try {
+    // FIX: Use spawn directly to get proper access to stdout
+    const { spawn } = require('child_process');
+    const ytdlpProcess = spawn(CONFIG.binaryPath, streamArgs);
 
-  ytdlp.stdout.pipe(res);
-  ytdlp.stderr.on("data", d => {
-    const msg = d.toString();
-    if (msg.includes("ERROR") || msg.includes("WARNING")) {
-      console.error("[Stream Error]:", msg);
+    // Pipe stdout to response
+    ytdlpProcess.stdout.pipe(res);
+
+    // Log errors from stderr
+    ytdlpProcess.stderr.on("data", (data) => {
+      const msg = data.toString();
+      if (msg.includes("ERROR")) {
+        console.error("[Stream Error]:", msg);
+      }
+    });
+
+    // Handle process completion
+    ytdlpProcess.on("close", (code) => {
+      if (code !== 0) {
+        console.log(`Stream closed with code ${code}`);
+      }
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Stream failed" });
+      }
+    });
+
+    ytdlpProcess.on("error", (err) => {
+      console.error("❌ Spawn Error:", err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Failed to start download" });
+      }
+    });
+
+    // Handle client disconnect
+    req.on("close", () => {
+      if (ytdlpProcess && !ytdlpProcess.killed) {
+        ytdlpProcess.kill("SIGKILL");
+        console.log("🛑 Client disconnected, download killed.");
+      }
+    });
+
+  } catch (err) {
+    console.error("❌ Download Error:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Download failed", details: err.message });
     }
-  });
-
-  ytdlp.on("close", code => {
-    if (code !== 0) console.log(`Stream closed with code ${code}`);
-    res.end();
-  });
-
-  req.on("close", () => {
-    if (ytdlp.ytDlpProcess && !ytdlp.ytDlpProcess.killed) {
-      ytdlp.ytDlpProcess.kill();
-      console.log("🛑 Client disconnected, download killed.");
-    }
-  });
+  }
 });
 
 // ---------------------------
