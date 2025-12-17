@@ -8,17 +8,17 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ---------------------------
-// CONFIGURATION
+// ENHANCED CONFIGURATION
 // ---------------------------
 
 const CONFIG = {
   binaryPath: "/usr/local/bin/yt-dlp",
   ffmpegPath: "/usr/bin/ffmpeg",
-  extractTimeout: 30000,
-  cacheTTL: 1800000, // 30 minutes
-  cacheCleanupInterval: 300000, // 5 minutes
-  maxRetries: 2,
-  retryDelay: 2000,
+  extractTimeout: 45000, // Increased for proxy
+  cacheTTL: 1800000,
+  cacheCleanupInterval: 300000,
+  maxRetries: 3, // Increased retries
+  retryDelay: 3000, // Longer delay between retries
   preview: {
     duration: 5,
     startTime: 0,
@@ -26,12 +26,25 @@ const CONFIG = {
     crf: 28,
     preset: "ultrafast",
   },
+  // Proxy configuration
+  proxy: {
+    enabled: process.env.USE_PROXY === "true",
+    url: process.env.PROXY_URL || null, // e.g., "http://user:pass@proxy.example.com:8080"
+    rotateOnError: true,
+  },
+  // User-Agent rotation
+  userAgents: [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  ],
 };
 
 const ytdlpWrap = new YTDlpWrap();
 ytdlpWrap.setBinaryPath(CONFIG.binaryPath);
 
 const cache = new Map();
+let currentUserAgentIndex = 0;
 
 // ---------------------------
 // PLATFORM DEFINITIONS
@@ -42,7 +55,18 @@ const PLATFORMS = {
     detect: (url) => /youtube\.com|youtu\.be|music\.youtube\.com/i.test(url),
     format: "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
     cookiesFile: "youtube-cookies.txt",
-    extraArgs: ["--no-playlist", "--no-cache-dir", "--geo-bypass"],
+    extraArgs: [
+      "--no-playlist",
+      "--no-cache-dir",
+      "--extractor-args", "youtube:player_client=android,web",
+      // Add these to help bypass detection
+      "--extractor-args", "youtube:skip=hls,dash",
+    ],
+    // Fallback to different extractors if main fails
+    fallbackFormats: [
+      "bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]",
+      "worst[ext=mp4]/worst",
+    ],
   },
 
   instagram: {
@@ -78,15 +102,35 @@ function detectPlatform(url) {
   return null;
 }
 
-function getPlatformArgs(platform) {
+function getRotatedUserAgent() {
+  const ua = CONFIG.userAgents[currentUserAgentIndex];
+  currentUserAgentIndex = (currentUserAgentIndex + 1) % CONFIG.userAgents.length;
+  return ua;
+}
+
+function getPlatformArgs(platform, attempt = 0) {
   const cfg = PLATFORMS[platform];
   if (!cfg) return [];
 
   const args = [...cfg.extraArgs];
+  
+  // Add proxy if enabled
+  if (CONFIG.proxy.enabled && CONFIG.proxy.url) {
+    args.push("--proxy", CONFIG.proxy.url);
+  }
+  
+  // Add rotating user agent
+  args.push("--user-agent", getRotatedUserAgent());
+  
+  // Add cookies if available
   const cookiePath = path.resolve(__dirname, cfg.cookiesFile);
-
   if (fs.existsSync(cookiePath)) {
     args.push("--cookies", cookiePath);
+  }
+  
+  // Add sleep to avoid rate limiting
+  if (platform === "youtube") {
+    args.push("--sleep-requests", "1");
   }
 
   return args;
@@ -103,19 +147,38 @@ function validateUrl(url) {
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
-async function retryOperation(operation) {
+async function retryOperation(operation, context = {}) {
   let lastErr;
+  
   for (let attempt = 1; attempt <= CONFIG.maxRetries; attempt++) {
     try {
-      return await operation();
+      return await operation(attempt);
     } catch (err) {
       lastErr = err;
+      const errMsg = err.message.toLowerCase();
+      
       console.log(
-        `⚠️ Attempt ${attempt}/${CONFIG.maxRetries} failed: ${err.message}`
+        `⚠️ Attempt ${attempt}/${CONFIG.maxRetries} failed: ${err.message.substring(0, 100)}`
       );
-      if (attempt < CONFIG.maxRetries) await sleep(CONFIG.retryDelay * attempt);
+      
+      // Don't retry on certain errors
+      if (
+        errMsg.includes("video unavailable") ||
+        errMsg.includes("private video") ||
+        errMsg.includes("copyright")
+      ) {
+        console.log("❌ Non-retryable error detected");
+        throw err;
+      }
+      
+      if (attempt < CONFIG.maxRetries) {
+        const delay = CONFIG.retryDelay * attempt;
+        console.log(`⏳ Waiting ${delay}ms before retry...`);
+        await sleep(delay);
+      }
     }
   }
+  
   throw lastErr;
 }
 
@@ -151,32 +214,36 @@ async function extractMetadata(videoUrl) {
 
   console.log(`📥 Extracting: ${videoUrl} [${platform}]`);
 
-  const platformArgs = getPlatformArgs(platform);
+  const result = await retryOperation(async (attempt) => {
+    const platformArgs = getPlatformArgs(platform, attempt);
 
-  const args = [
-    videoUrl,
-    "--dump-json",
-    "--no-warnings",
-    "--no-playlist",
-    "--skip-download",
-    ...platformArgs,
-  ];
+    const args = [
+      videoUrl,
+      "--dump-json",
+      "--no-warnings",
+      "--no-playlist",
+      "--skip-download",
+      ...platformArgs,
+    ];
 
-  const stdout = await retryOperation(() =>
-    Promise.race([
+    console.log(`🔧 Attempt ${attempt} args:`, args.join(" "));
+
+    const stdout = await Promise.race([
       ytdlpWrap.execPromise(args),
       new Promise((_, reject) =>
         setTimeout(
-          () => reject(new Error("Extraction timed out (30s)")),
+          () => reject(new Error("Extraction timed out")),
           CONFIG.extractTimeout
         )
       ),
-    ])
-  );
+    ]);
 
-  if (!stdout) throw new Error("Empty extractor output");
+    if (!stdout) throw new Error("Empty extractor output");
 
-  const meta = JSON.parse(stdout);
+    return stdout;
+  });
+
+  const meta = JSON.parse(result);
   const resolution =
     meta.width && meta.height
       ? `${meta.width}x${meta.height}`
@@ -196,7 +263,6 @@ async function extractMetadata(videoUrl) {
     format: meta.ext || "mp4",
   };
 
-  // Cache by both URL and ID with consistent structure
   const cacheEntry = { 
     metadata, 
     timestamp: Date.now(),
@@ -269,7 +335,6 @@ async function streamMp4Preview(videoUrl, platform, res, req) {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
-  // Error handling for processes
   ytdlp.on("error", (err) => {
     console.error("❌ yt-dlp spawn error:", err.message);
     killProcess(ffmpeg, "ffmpeg");
@@ -280,7 +345,6 @@ async function streamMp4Preview(videoUrl, platform, res, req) {
     killProcess(ytdlp, "yt-dlp");
   });
 
-  // Log stderr for debugging
   ytdlp.stderr.on("data", (data) => {
     const msg = data.toString();
     if (msg.includes("ERROR") || msg.includes("WARNING")) {
@@ -295,7 +359,6 @@ async function streamMp4Preview(videoUrl, platform, res, req) {
     }
   });
 
-  // Pipe streams
   ytdlp.stdout.pipe(ffmpeg.stdin);
 
   res.setHeader("Content-Type", "video/mp4");
@@ -304,7 +367,6 @@ async function streamMp4Preview(videoUrl, platform, res, req) {
 
   ffmpeg.stdout.pipe(res);
 
-  // Handle pipe errors gracefully
   ytdlp.stdout.on("error", (e) => {
     if (e.code !== "EPIPE") console.error("yt-dlp stdout error:", e);
   });
@@ -313,7 +375,6 @@ async function streamMp4Preview(videoUrl, platform, res, req) {
     if (e.code !== "EPIPE") console.error("ffmpeg stdin error:", e);
   });
 
-  // Cleanup on process close
   const cleanup = () => {
     killProcess(ytdlp, "yt-dlp");
     killProcess(ffmpeg, "ffmpeg");
@@ -321,8 +382,6 @@ async function streamMp4Preview(videoUrl, platform, res, req) {
 
   ffmpeg.on("close", cleanup);
   ytdlp.on("close", () => killProcess(ffmpeg, "ffmpeg"));
-
-  // Cleanup on client disconnect
   req.on("close", cleanup);
 }
 
@@ -336,6 +395,7 @@ app.get("/health", (req, res) => {
     platform: process.platform,
     cacheSize: cache.size,
     uptime: process.uptime(),
+    proxyEnabled: CONFIG.proxy.enabled,
   });
 });
 
@@ -362,12 +422,22 @@ app.get("/extract", async (req, res) => {
     });
   } catch (err) {
     let code = 500;
-    if (err.message.includes("Unsupported")) code = 400;
-    if (err.message.includes("timed out")) code = 504;
+    const errMsg = err.message.toLowerCase();
+    
+    if (errMsg.includes("unsupported")) code = 400;
+    if (errMsg.includes("timed out")) code = 504;
+    if (errMsg.includes("not a bot") || errMsg.includes("sign in")) {
+      code = 403;
+    }
+
+    console.error("❌ Extraction Error:", err.message);
 
     res.status(code).json({
       error: "Extraction failed",
       details: err.message,
+      suggestion: code === 403 
+        ? "YouTube bot detection triggered. Consider using YouTube API or proxy service."
+        : null,
     });
   }
 });
@@ -498,8 +568,11 @@ async function initializeApp() {
 
     const version = await ytdlpWrap.execPromise(["--version"]);
     console.log(`✅ yt-dlp version: ${version.trim()}`);
+    
+    if (CONFIG.proxy.enabled) {
+      console.log(`🌐 Proxy enabled: ${CONFIG.proxy.url ? 'Configured' : 'Not configured'}`);
+    }
 
-    // Start cache cleanup interval
     setInterval(cleanupCache, CONFIG.cacheCleanupInterval);
     console.log(`🧹 Cache cleanup scheduled every ${CONFIG.cacheCleanupInterval / 1000}s`);
 
