@@ -196,6 +196,7 @@ async function extractMetadata(videoUrl) {
     "--no-warnings",
     "--no-playlist",
     "--skip-download",
+     "--js-runtime", "deno", 
     ...platformArgs,
   ];
 
@@ -273,6 +274,7 @@ async function generatePreviewFile(videoUrl, platform, videoId) {
       "--no-playlist",
       "--no-warnings",
       "--force-ipv4",
+       "--js-runtime", "deno", 
       ...platformArgs,
     ];
 

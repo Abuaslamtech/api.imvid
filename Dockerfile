@@ -1,10 +1,7 @@
-# Use a lightweight Debian-based Node image (Alpine often breaks Python/FFmpeg)
+# Use a lightweight Debian-based Node image
 FROM node:20-slim
 
-# 1. Install System Dependencies
-# aria2: Multi-connection download accelerator (CRITICAL FOR SPEED)
-# dumb-init: Prevents zombie processes
-# python3/ffmpeg: Required for yt-dlp
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     python3 \
     ffmpeg \
@@ -12,23 +9,28 @@ RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
     dumb-init \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install yt-dlp globally
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-RUN chmod a+rx /usr/local/bin/yt-dlp
+# Install Deno system-wide
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
+# Install yt-dlp
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+    -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
+
+# Verify installations
+RUN deno --version && yt-dlp --version
+
+# App setup
 WORKDIR /app
-
-# 3. Dependencies
 COPY package*.json ./
 RUN npm ci --only=production
-
-# 4. Copy Code
 COPY . .
 
-# 5. Start with dumb-init to handle signals correctly
-ENV PORT=3000
+# Render assigns PORT dynamically
 EXPOSE 3000
+
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["node", "index.js"]
