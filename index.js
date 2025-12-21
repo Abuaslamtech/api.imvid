@@ -47,7 +47,7 @@ const PLATFORMS = {
     detect: (url) => /youtube\.com|youtu\.be|music\.youtube\.com/i.test(url),
     format: "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
     cookiesFile: "youtube-cookies.txt",
-    extraArgs: ["--no-playlist", "--no-cache-dir", "--geo-bypass"],
+    extraArgs: ["--no-playlist", "--no-cache-dir",  "--extractor-args", "youtube:player_client=ios",],
   },
 
   instagram: {
