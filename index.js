@@ -47,7 +47,12 @@ const PLATFORMS = {
     detect: (url) => /youtube\.com|youtu\.be|music\.youtube\.com/i.test(url),
     format: "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
     cookiesFile: "youtube-cookies.txt",
-    extraArgs: ["--no-playlist", "--no-cache-dir",  "--extractor-args", "youtube:player_client=ios",],
+    extraArgs: [
+      "--no-playlist",
+      "--no-cache-dir",
+      "--extractor-args",
+      "youtube:player_client=android",
+    ],
   },
 
   instagram: {
@@ -57,7 +62,7 @@ const PLATFORMS = {
     extraArgs: [
       "--no-check-certificate",
       "--user-agent",
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     ],
   },
 
@@ -94,9 +99,9 @@ function getPlatformArgs(platform) {
   const args = [...cfg.extraArgs];
   const cookiePath = path.resolve(__dirname, cfg.cookiesFile);
 
-  if (fs.existsSync(cookiePath)) {
-    args.push("--cookies", cookiePath);
-  }
+  // if (fs.existsSync(cookiePath)) {
+  //   args.push("--cookies", cookiePath);
+  // }
 
   return args;
 }
@@ -157,7 +162,7 @@ function cleanupCache() {
       // Delete the file (async, non-blocking)
       if (fs.existsSync(value.path)) {
         fs.unlink(value.path, (err) => {
-          if (err && err.code !== 'ENOENT') {
+          if (err && err.code !== "ENOENT") {
             console.error(`Failed to delete preview: ${err.message}`);
           }
         });
@@ -196,7 +201,8 @@ async function extractMetadata(videoUrl) {
     "--no-warnings",
     "--no-playlist",
     "--skip-download",
-     "--js-runtime", "deno", 
+    "--js-runtime",
+    "deno",
     ...platformArgs,
   ];
 
@@ -274,7 +280,8 @@ async function generatePreviewFile(videoUrl, platform, videoId) {
       "--no-playlist",
       "--no-warnings",
       "--force-ipv4",
-       "--js-runtime", "deno", 
+      "--js-runtime",
+      "deno",
       ...platformArgs,
     ];
 
@@ -322,7 +329,7 @@ async function generatePreviewFile(videoUrl, platform, videoId) {
 
     // Pipe with EPIPE error handling
     const pipeStream = ytdlp.stdout.pipe(ffmpeg.stdin);
-    
+
     pipeStream.on("error", (err) => {
       if (err.code === "EPIPE") {
         console.warn("⚠️ EPIPE detected (ffmpeg stdin closed early)");
@@ -368,11 +375,15 @@ async function generatePreviewFile(videoUrl, platform, videoId) {
     ytdlp.on("close", (code) => {
       ytdlpExited = true;
       console.log(`yt-dlp exited with code: ${code}`);
-      
+
       if (code !== 0 && !hasErrored) {
         hasErrored = true;
         killProcess(ffmpeg, "ffmpeg");
-        reject(new Error(`yt-dlp failed with code ${code}: ${errorMsg || "Unknown error"}`));
+        reject(
+          new Error(
+            `yt-dlp failed with code ${code}: ${errorMsg || "Unknown error"}`
+          )
+        );
       }
     });
 
@@ -389,9 +400,9 @@ async function generatePreviewFile(videoUrl, platform, videoId) {
     ffmpeg.on("close", (code) => {
       ffmpegExited = true;
       console.log(`ffmpeg exited with code: ${code}`);
-      
+
       if (hasErrored) return; // Already rejected
-      
+
       if (code === 0 && fs.existsSync(previewPath)) {
         console.log(`✅ Preview generated: ${previewPath}`);
         resolve(previewPath);
@@ -400,7 +411,9 @@ async function generatePreviewFile(videoUrl, platform, videoId) {
         const fileExists = fs.existsSync(previewPath);
         reject(
           new Error(
-            `Preview generation failed (code ${code}, file exists: ${fileExists}): ${errorMsg || "Unknown error"}`
+            `Preview generation failed (code ${code}, file exists: ${fileExists}): ${
+              errorMsg || "Unknown error"
+            }`
           )
         );
       }
@@ -438,7 +451,11 @@ async function getOrGeneratePreview(videoId, originalUrl, platform) {
   // Start new preview generation
   const generationPromise = (async () => {
     try {
-      const previewPath = await generatePreviewFile(originalUrl, platform, videoId);
+      const previewPath = await generatePreviewFile(
+        originalUrl,
+        platform,
+        videoId
+      );
       previewCache.set(videoId, {
         path: previewPath,
         timestamp: Date.now(),
@@ -525,13 +542,21 @@ app.get("/preview", async (req, res) => {
 
   try {
     // Get or generate preview (concurrency-safe)
-    const previewPath = await getOrGeneratePreview(videoId, originalUrl, platform);
+    const previewPath = await getOrGeneratePreview(
+      videoId,
+      originalUrl,
+      platform
+    );
 
     // Verify file still exists (serverless/Render safety check)
     if (!fs.existsSync(previewPath)) {
       console.warn(`⚠️ Preview file vanished: ${previewPath}. Regenerating...`);
       previewCache.delete(videoId);
-      const newPath = await getOrGeneratePreview(videoId, originalUrl, platform);
+      const newPath = await getOrGeneratePreview(
+        videoId,
+        originalUrl,
+        platform
+      );
       return serveVideoFile(newPath, req, res);
     }
 
@@ -540,13 +565,13 @@ app.get("/preview", async (req, res) => {
   } catch (err) {
     console.error("❌ Preview error:", err.message);
     console.error("Stack:", err.stack);
-    
+
     if (!res.headersSent) {
       res.status(500).json({
         error: "Preview generation failed",
         details: err.message,
         platform: platform,
-        videoId: videoId
+        videoId: videoId,
       });
     }
   }
