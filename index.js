@@ -54,7 +54,11 @@ const PLATFORMS = {
     detect: (url) => /instagram\.com|instagr\.am/i.test(url),
     format: "best[vcodec^=avc1]/best",
     cookiesFile: "instagram-cookies.txt",
-    extraArgs: ["--no-check-certificate"],
+    extraArgs: [
+      "--no-check-certificate",
+      "--user-agent",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ],
   },
 
   tiktok: {
@@ -153,7 +157,7 @@ function cleanupCache() {
       // Delete the file (async, non-blocking)
       if (fs.existsSync(value.path)) {
         fs.unlink(value.path, (err) => {
-          if (err && err.code !== "ENOENT") {
+          if (err && err.code !== 'ENOENT') {
             console.error(`Failed to delete preview: ${err.message}`);
           }
         });
@@ -308,45 +312,105 @@ async function generatePreviewFile(videoUrl, platform, videoId) {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    ytdlp.stdout.pipe(ffmpeg.stdin);
-
-    // Error handling
+    // Track process state
+    let ytdlpExited = false;
+    let ffmpegExited = false;
     let errorMsg = "";
+    let hasErrored = false;
 
+    // Pipe with EPIPE error handling
+    const pipeStream = ytdlp.stdout.pipe(ffmpeg.stdin);
+    
+    pipeStream.on("error", (err) => {
+      if (err.code === "EPIPE") {
+        console.warn("⚠️ EPIPE detected (ffmpeg stdin closed early)");
+        // Don't reject on EPIPE, wait for process exit
+      } else {
+        console.error("Pipe error:", err);
+      }
+    });
+
+    // Handle ytdlp stdout errors (like EPIPE when ffmpeg dies)
+    ytdlp.stdout.on("error", (err) => {
+      if (err.code !== "EPIPE") {
+        console.error("yt-dlp stdout error:", err);
+      }
+    });
+
+    // Handle ffmpeg stdin errors
+    ffmpeg.stdin.on("error", (err) => {
+      if (err.code !== "EPIPE") {
+        console.error("ffmpeg stdin error:", err);
+      }
+    });
+
+    // Collect error messages
     ytdlp.stderr.on("data", (data) => {
       const msg = data.toString();
+      console.log("[yt-dlp]:", msg.trim());
       if (msg.includes("ERROR")) {
-        errorMsg += msg;
+        errorMsg += `[yt-dlp] ${msg}\n`;
       }
     });
 
     ffmpeg.stderr.on("data", (data) => {
       const msg = data.toString();
-      if (msg.includes("Error")) {
-        errorMsg += msg;
+      // Only log actual errors, not ffmpeg progress
+      if (msg.includes("Error") || msg.includes("Invalid")) {
+        console.error("[ffmpeg]:", msg.trim());
+        errorMsg += `[ffmpeg] ${msg}\n`;
       }
     });
 
+    // yt-dlp exit handler
+    ytdlp.on("close", (code) => {
+      ytdlpExited = true;
+      console.log(`yt-dlp exited with code: ${code}`);
+      
+      if (code !== 0 && !hasErrored) {
+        hasErrored = true;
+        killProcess(ffmpeg, "ffmpeg");
+        reject(new Error(`yt-dlp failed with code ${code}: ${errorMsg || "Unknown error"}`));
+      }
+    });
+
+    ytdlp.on("error", (err) => {
+      if (!hasErrored) {
+        hasErrored = true;
+        console.error("yt-dlp spawn error:", err);
+        killProcess(ffmpeg, "ffmpeg");
+        reject(new Error(`yt-dlp error: ${err.message}`));
+      }
+    });
+
+    // ffmpeg exit handler
     ffmpeg.on("close", (code) => {
+      ffmpegExited = true;
+      console.log(`ffmpeg exited with code: ${code}`);
+      
+      if (hasErrored) return; // Already rejected
+      
       if (code === 0 && fs.existsSync(previewPath)) {
         console.log(`✅ Preview generated: ${previewPath}`);
         resolve(previewPath);
       } else {
         killProcess(ytdlp, "yt-dlp");
+        const fileExists = fs.existsSync(previewPath);
         reject(
-          new Error(`Preview generation failed: ${errorMsg || "Unknown error"}`)
+          new Error(
+            `Preview generation failed (code ${code}, file exists: ${fileExists}): ${errorMsg || "Unknown error"}`
+          )
         );
       }
     });
 
     ffmpeg.on("error", (err) => {
-      killProcess(ytdlp, "yt-dlp");
-      reject(err);
-    });
-
-    ytdlp.on("error", (err) => {
-      killProcess(ffmpeg, "ffmpeg");
-      reject(err);
+      if (!hasErrored) {
+        hasErrored = true;
+        console.error("ffmpeg spawn error:", err);
+        killProcess(ytdlp, "yt-dlp");
+        reject(new Error(`ffmpeg error: ${err.message}`));
+      }
     });
   });
 }
@@ -372,11 +436,7 @@ async function getOrGeneratePreview(videoId, originalUrl, platform) {
   // Start new preview generation
   const generationPromise = (async () => {
     try {
-      const previewPath = await generatePreviewFile(
-        originalUrl,
-        platform,
-        videoId
-      );
+      const previewPath = await generatePreviewFile(originalUrl, platform, videoId);
       previewCache.set(videoId, {
         path: previewPath,
         timestamp: Date.now(),
@@ -459,33 +519,32 @@ app.get("/preview", async (req, res) => {
     return res.status(400).json({ error: "Unsupported platform" });
   }
 
+  console.log(`🎥 Preview request for ${videoId} (${platform})`);
+
   try {
     // Get or generate preview (concurrency-safe)
-    const previewPath = await getOrGeneratePreview(
-      videoId,
-      originalUrl,
-      platform
-    );
+    const previewPath = await getOrGeneratePreview(videoId, originalUrl, platform);
 
     // Verify file still exists (serverless/Render safety check)
     if (!fs.existsSync(previewPath)) {
       console.warn(`⚠️ Preview file vanished: ${previewPath}. Regenerating...`);
       previewCache.delete(videoId);
-      const newPath = await getOrGeneratePreview(
-        videoId,
-        originalUrl,
-        platform
-      );
+      const newPath = await getOrGeneratePreview(videoId, originalUrl, platform);
       return serveVideoFile(newPath, req, res);
     }
 
+    console.log(`📤 Serving preview: ${previewPath}`);
     serveVideoFile(previewPath, req, res);
   } catch (err) {
-    console.error("Preview error:", err);
+    console.error("❌ Preview error:", err.message);
+    console.error("Stack:", err.stack);
+    
     if (!res.headersSent) {
       res.status(500).json({
         error: "Preview generation failed",
         details: err.message,
+        platform: platform,
+        videoId: videoId
       });
     }
   }
