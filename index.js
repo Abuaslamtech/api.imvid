@@ -3,6 +3,9 @@ const YTDlpWrap = require("yt-dlp-wrap").default;
 const path = require("path");
 const fs = require("fs");
 const { spawn } = require("child_process");
+const os = require("os");
+const { promisify } = require("util");
+const unlinkAsync = promisify(fs.unlink);
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -23,15 +26,17 @@ const CONFIG = {
     duration: 5,
     startTime: 0,
     width: 480,
-    crf: 28,
-    preset: "ultrafast",
+    crf: 23,
+    preset: "veryfast",
   },
 };
 
 const ytdlpWrap = new YTDlpWrap();
 ytdlpWrap.setBinaryPath(CONFIG.binaryPath);
 
-const cache = new Map();
+const cache = new Map(); // videoId/url -> { metadata, timestamp, originalUrl }
+const previewCache = new Map(); // videoId -> { path, timestamp }
+const pendingPreviews = new Map(); // videoId -> Promise (prevents concurrent generation)
 
 // ---------------------------
 // PLATFORM DEFINITIONS
@@ -119,17 +124,45 @@ async function retryOperation(operation) {
   throw lastErr;
 }
 
+function killProcess(process, name) {
+  if (process && !process.killed) {
+    process.kill("SIGKILL");
+    console.log(`🛑 Killed ${name} process`);
+  }
+}
+
+// ---------------------------
+// CACHE CLEANUP (SINGLE DEFINITION)
+// ---------------------------
+
 function cleanupCache() {
   const now = Date.now();
   let removed = 0;
-  
+
+  // Clean metadata cache
   for (const [key, value] of cache.entries()) {
     if (now - value.timestamp > CONFIG.cacheTTL) {
       cache.delete(key);
       removed++;
     }
   }
-  
+
+  // Clean preview files
+  for (const [videoId, value] of previewCache.entries()) {
+    if (now - value.timestamp > CONFIG.cacheTTL) {
+      // Delete the file (async, non-blocking)
+      if (fs.existsSync(value.path)) {
+        fs.unlink(value.path, (err) => {
+          if (err && err.code !== "ENOENT") {
+            console.error(`Failed to delete preview: ${err.message}`);
+          }
+        });
+      }
+      previewCache.delete(videoId);
+      removed++;
+    }
+  }
+
   if (removed > 0) {
     console.log(`🧹 Cleaned up ${removed} expired cache entries`);
   }
@@ -197,12 +230,12 @@ async function extractMetadata(videoUrl) {
   };
 
   // Cache by both URL and ID with consistent structure
-  const cacheEntry = { 
-    metadata, 
+  const cacheEntry = {
+    metadata,
     timestamp: Date.now(),
-    originalUrl: videoUrl 
+    originalUrl: videoUrl,
   };
-  
+
   cache.set(videoUrl, cacheEntry);
   cache.set(meta.id, cacheEntry);
 
@@ -210,120 +243,153 @@ async function extractMetadata(videoUrl) {
 }
 
 // ---------------------------
-// PREVIEW GENERATION
+// PREVIEW GENERATION (WITH CONCURRENCY CONTROL)
 // ---------------------------
 
-function killProcess(process, name) {
-  if (process && !process.killed) {
-    process.kill("SIGKILL");
-    console.log(`🛑 Killed ${name} process`);
-  }
-}
-
-async function streamMp4Preview(videoUrl, platform, res, req) {
+async function generatePreviewFile(videoUrl, platform, videoId) {
   const platformArgs = getPlatformArgs(platform);
   const { startTime, duration, width, crf, preset } = CONFIG.preview;
 
-  console.log(`🎬 Generating ${duration}s MP4 preview for ${platform}...`);
+  // Use system temp directory with unique filename
+  const tempDir = os.tmpdir();
+  const previewPath = path.join(
+    tempDir,
+    `preview_${videoId}_${Date.now()}.mp4`
+  );
 
-  const ytdlpArgs = [
-    videoUrl,
-    "-o",
-    "-",
-    "-f",
-    "worst[ext=mp4]/worst[height<=480]/worst",
-    "--no-playlist",
-    "--no-warnings",
-    "--force-ipv4",
-    ...platformArgs,
-  ];
+  console.log(`🎬 Generating preview file for ${platform}...`);
 
-  const ffmpegArgs = [
-    "-i",
-    "pipe:0",
-    "-ss",
-    String(startTime),
-    "-t",
-    String(duration),
-    "-vf",
-    `scale=${width}:-2`,
-    "-c:v",
-    "libx264",
-    "-preset",
-    preset,
-    "-crf",
-    String(crf),
-    "-an",
-    "-movflags",
-    "+frag_keyframe+empty_moov+default_base_moof",
-    "-f",
-    "mp4",
-    "pipe:1",
-  ];
+  return new Promise((resolve, reject) => {
+    const ytdlpArgs = [
+      videoUrl,
+      "-o",
+      "-",
+      "-f",
+      "worst[ext=mp4]/worst[height<=480]/worst",
+      "--no-playlist",
+      "--no-warnings",
+      "--force-ipv4",
+      ...platformArgs,
+    ];
 
-  const ytdlp = spawn(CONFIG.binaryPath, ytdlpArgs, {
-    stdio: ["ignore", "pipe", "pipe"],
+    const ffmpegArgs = [
+      "-i",
+      "pipe:0",
+      "-ss",
+      String(startTime),
+      "-t",
+      String(duration),
+      "-vf",
+      `scale=${width}:-2`,
+      "-c:v",
+      "libx264",
+      "-preset",
+      preset,
+      "-crf",
+      String(crf),
+      "-profile:v",
+      "baseline",
+      "-level",
+      "3.0",
+      "-an",
+      "-movflags",
+      "+faststart",
+      "-f",
+      "mp4",
+      "-y", // Overwrite if exists
+      previewPath,
+    ];
+
+    const ytdlp = spawn(CONFIG.binaryPath, ytdlpArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const ffmpeg = spawn(CONFIG.ffmpegPath, ffmpegArgs, {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    ytdlp.stdout.pipe(ffmpeg.stdin);
+
+    // Error handling
+    let errorMsg = "";
+
+    ytdlp.stderr.on("data", (data) => {
+      const msg = data.toString();
+      if (msg.includes("ERROR")) {
+        errorMsg += msg;
+      }
+    });
+
+    ffmpeg.stderr.on("data", (data) => {
+      const msg = data.toString();
+      if (msg.includes("Error")) {
+        errorMsg += msg;
+      }
+    });
+
+    ffmpeg.on("close", (code) => {
+      if (code === 0 && fs.existsSync(previewPath)) {
+        console.log(`✅ Preview generated: ${previewPath}`);
+        resolve(previewPath);
+      } else {
+        killProcess(ytdlp, "yt-dlp");
+        reject(
+          new Error(`Preview generation failed: ${errorMsg || "Unknown error"}`)
+        );
+      }
+    });
+
+    ffmpeg.on("error", (err) => {
+      killProcess(ytdlp, "yt-dlp");
+      reject(err);
+    });
+
+    ytdlp.on("error", (err) => {
+      killProcess(ffmpeg, "ffmpeg");
+      reject(err);
+    });
   });
+}
 
-  const ffmpeg = spawn(CONFIG.ffmpegPath, ffmpegArgs, {
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+// ---------------------------
+// CONCURRENT-SAFE PREVIEW GETTER
+// ---------------------------
 
-  // Error handling for processes
-  ytdlp.on("error", (err) => {
-    console.error("❌ yt-dlp spawn error:", err.message);
-    killProcess(ffmpeg, "ffmpeg");
-  });
+async function getOrGeneratePreview(videoId, originalUrl, platform) {
+  // Check if preview already exists and is valid
+  const cachedPreview = previewCache.get(videoId);
+  if (cachedPreview && fs.existsSync(cachedPreview.path)) {
+    console.log(`✅ Using cached preview for ${videoId}`);
+    return cachedPreview.path;
+  }
 
-  ffmpeg.on("error", (err) => {
-    console.error("❌ ffmpeg spawn error:", err.message);
-    killProcess(ytdlp, "yt-dlp");
-  });
+  // Check if preview is already being generated
+  if (pendingPreviews.has(videoId)) {
+    console.log(`⏳ Waiting for ongoing preview generation: ${videoId}`);
+    return await pendingPreviews.get(videoId);
+  }
 
-  // Log stderr for debugging
-  ytdlp.stderr.on("data", (data) => {
-    const msg = data.toString();
-    if (msg.includes("ERROR") || msg.includes("WARNING")) {
-      console.error("[yt-dlp]:", msg.trim());
+  // Start new preview generation
+  const generationPromise = (async () => {
+    try {
+      const previewPath = await generatePreviewFile(
+        originalUrl,
+        platform,
+        videoId
+      );
+      previewCache.set(videoId, {
+        path: previewPath,
+        timestamp: Date.now(),
+      });
+      return previewPath;
+    } finally {
+      // Clean up pending flag
+      pendingPreviews.delete(videoId);
     }
-  });
+  })();
 
-  ffmpeg.stderr.on("data", (data) => {
-    const msg = data.toString();
-    if (msg.includes("Error") || msg.includes("Invalid")) {
-      console.error("[ffmpeg]:", msg.trim());
-    }
-  });
-
-  // Pipe streams
-  ytdlp.stdout.pipe(ffmpeg.stdin);
-
-  res.setHeader("Content-Type", "video/mp4");
-  res.setHeader("Cache-Control", "public, max-age=3600");
-  res.setHeader("Accept-Ranges", "none");
-
-  ffmpeg.stdout.pipe(res);
-
-  // Handle pipe errors gracefully
-  ytdlp.stdout.on("error", (e) => {
-    if (e.code !== "EPIPE") console.error("yt-dlp stdout error:", e);
-  });
-
-  ffmpeg.stdin.on("error", (e) => {
-    if (e.code !== "EPIPE") console.error("ffmpeg stdin error:", e);
-  });
-
-  // Cleanup on process close
-  const cleanup = () => {
-    killProcess(ytdlp, "yt-dlp");
-    killProcess(ffmpeg, "ffmpeg");
-  };
-
-  ffmpeg.on("close", cleanup);
-  ytdlp.on("close", () => killProcess(ffmpeg, "ffmpeg"));
-
-  // Cleanup on client disconnect
-  req.on("close", cleanup);
+  pendingPreviews.set(videoId, generationPromise);
+  return await generationPromise;
 }
 
 // ---------------------------
@@ -335,13 +401,15 @@ app.get("/health", (req, res) => {
     status: "ok",
     platform: process.platform,
     cacheSize: cache.size,
+    previewCacheSize: previewCache.size,
+    pendingPreviews: pendingPreviews.size,
     uptime: process.uptime(),
   });
 });
 
 app.get("/extract", async (req, res) => {
   const videoUrl = req.query.url;
-  
+
   if (!videoUrl) {
     return res.status(400).json({ error: "Missing 'url' parameter" });
   }
@@ -374,7 +442,7 @@ app.get("/extract", async (req, res) => {
 
 app.get("/preview", async (req, res) => {
   const videoId = req.query.vid;
-  
+
   if (!videoId) {
     return res.status(400).json({ error: "Missing 'vid' parameter" });
   }
@@ -386,24 +454,95 @@ app.get("/preview", async (req, res) => {
 
   const { originalUrl } = cached;
   const platform = detectPlatform(originalUrl);
-  
+
   if (!platform) {
     return res.status(400).json({ error: "Unsupported platform" });
   }
 
   try {
-    await streamMp4Preview(originalUrl, platform, res, req);
+    // Get or generate preview (concurrency-safe)
+    const previewPath = await getOrGeneratePreview(
+      videoId,
+      originalUrl,
+      platform
+    );
+
+    // Verify file still exists (serverless/Render safety check)
+    if (!fs.existsSync(previewPath)) {
+      console.warn(`⚠️ Preview file vanished: ${previewPath}. Regenerating...`);
+      previewCache.delete(videoId);
+      const newPath = await getOrGeneratePreview(
+        videoId,
+        originalUrl,
+        platform
+      );
+      return serveVideoFile(newPath, req, res);
+    }
+
+    serveVideoFile(previewPath, req, res);
   } catch (err) {
     console.error("Preview error:", err);
     if (!res.headersSent) {
-      res.status(500).json({ error: "Preview generation failed" });
+      res.status(500).json({
+        error: "Preview generation failed",
+        details: err.message,
+      });
     }
   }
 });
 
+// Helper function to serve video with range support
+function serveVideoFile(filePath, req, res) {
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = end - start + 1;
+
+    res.writeHead(206, {
+      "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+      "Accept-Ranges": "bytes",
+      "Content-Length": chunksize,
+      "Content-Type": "video/mp4",
+      "Cache-Control": "public, max-age=3600",
+    });
+
+    const stream = fs.createReadStream(filePath, { start, end });
+    stream.pipe(res);
+
+    stream.on("error", (err) => {
+      console.error("Stream error:", err);
+      if (!res.headersSent) {
+        res.status(500).end();
+      }
+    });
+  } else {
+    res.writeHead(200, {
+      "Content-Length": fileSize,
+      "Content-Type": "video/mp4",
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "public, max-age=3600",
+    });
+
+    const stream = fs.createReadStream(filePath);
+    stream.pipe(res);
+
+    stream.on("error", (err) => {
+      console.error("Stream error:", err);
+      if (!res.headersSent) {
+        res.status(500).end();
+      }
+    });
+  }
+}
+
 app.get("/download", async (req, res) => {
   const videoId = req.query.vid;
-  
+
   if (!videoId) {
     return res.status(400).json({ error: "Missing 'vid' parameter" });
   }
@@ -420,9 +559,7 @@ app.get("/download", async (req, res) => {
 
   console.log(`⬇️ Streaming: ${metadata.title}`);
 
-  const filename = metadata.title
-    .replace(/[^a-z0-9]/gi, "_")
-    .substring(0, 50);
+  const filename = metadata.title.replace(/[^a-z0-9]/gi, "_").substring(0, 50);
 
   res.setHeader(
     "Content-Disposition",
@@ -501,7 +638,9 @@ async function initializeApp() {
 
     // Start cache cleanup interval
     setInterval(cleanupCache, CONFIG.cacheCleanupInterval);
-    console.log(`🧹 Cache cleanup scheduled every ${CONFIG.cacheCleanupInterval / 1000}s`);
+    console.log(
+      `🧹 Cache cleanup scheduled every ${CONFIG.cacheCleanupInterval / 1000}s`
+    );
 
     console.log("🚀 Server running on port", port);
     app.listen(port);
