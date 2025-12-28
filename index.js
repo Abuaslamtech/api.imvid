@@ -259,16 +259,16 @@ async function extractMetadata(videoUrl) {
 
 async function generatePreviewFile(videoUrl, platform, videoId) {
   const platformArgs = getPlatformArgs(platform);
-  const { startTime, duration, width, crf, preset } = CONFIG.preview;
+  const { duration } = CONFIG.preview;
 
-  // Use system temp directory with unique filename
   const tempDir = os.tmpdir();
   const previewPath = path.join(
     tempDir,
     `preview_${videoId}_${Date.now()}.mp4`
   );
 
-  console.log(`🎬 Generating preview file for ${platform}...`);
+  const previewFormat =
+    "worstvideo[ext=mp4][vcodec^=avc1][height<=480]+worstaudio[ext=m4a]/worst[ext=mp4][height<=480]/worst";
 
   return new Promise((resolve, reject) => {
     const ytdlpArgs = [
@@ -276,7 +276,7 @@ async function generatePreviewFile(videoUrl, platform, videoId) {
       "-o",
       "-",
       "-f",
-      "worst[ext=mp4]/worst[height<=480]/worst",
+      previewFormat,
       "--no-playlist",
       "--no-warnings",
       "--force-ipv4",
@@ -288,144 +288,83 @@ async function generatePreviewFile(videoUrl, platform, videoId) {
     const ffmpegArgs = [
       "-i",
       "pipe:0",
-      "-ss",
-      String(startTime),
       "-t",
       String(duration),
-      "-vf",
-      `scale=${width}:-2`,
-      "-c:v",
-      "libx264",
-      "-preset",
-      preset,
-      "-crf",
-      String(crf),
-      "-profile:v",
-      "baseline",
-      "-level",
-      "3.0",
-      "-an",
+      "-c",
+      "copy",
       "-movflags",
       "+faststart",
       "-f",
       "mp4",
-      "-y", // Overwrite if exists
+      "-y",
       previewPath,
     ];
 
     const ytdlp = spawn(CONFIG.binaryPath, ytdlpArgs, {
       stdio: ["ignore", "pipe", "pipe"],
     });
-
     const ffmpeg = spawn(CONFIG.ffmpegPath, ffmpegArgs, {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    // Track process state
-    let ytdlpExited = false;
-    let ffmpegExited = false;
-    let errorMsg = "";
     let hasErrored = false;
+    let errorMsg = "";
 
-    // Pipe with EPIPE error handling
+    // Pipe + EPIPE protection
     const pipeStream = ytdlp.stdout.pipe(ffmpeg.stdin);
 
     pipeStream.on("error", (err) => {
-      if (err.code === "EPIPE") {
-        console.warn("⚠️ EPIPE detected (ffmpeg stdin closed early)");
-        // Don't reject on EPIPE, wait for process exit
-      } else {
-        console.error("Pipe error:", err);
-      }
+      if (err.code === "EPIPE") return; // common when ffmpeg closes early after -t
+      console.error("Pipe error:", err);
     });
 
-    // Handle ytdlp stdout errors (like EPIPE when ffmpeg dies)
     ytdlp.stdout.on("error", (err) => {
-      if (err.code !== "EPIPE") {
-        console.error("yt-dlp stdout error:", err);
-      }
+      if (err.code === "EPIPE") return;
+      console.error("yt-dlp stdout error:", err);
     });
 
-    // Handle ffmpeg stdin errors
     ffmpeg.stdin.on("error", (err) => {
-      if (err.code !== "EPIPE") {
-        console.error("ffmpeg stdin error:", err);
-      }
+      if (err.code === "EPIPE") return;
+      console.error("ffmpeg stdin error:", err);
     });
 
-    // Collect error messages
-    ytdlp.stderr.on("data", (data) => {
-      const msg = data.toString();
-      console.log("[yt-dlp]:", msg.trim());
-      if (msg.includes("ERROR")) {
-        errorMsg += `[yt-dlp] ${msg}\n`;
-      }
-    });
+    ytdlp.stderr.on("data", (d) => (errorMsg += d.toString()));
+    ffmpeg.stderr.on("data", (d) => (errorMsg += d.toString()));
 
-    ffmpeg.stderr.on("data", (data) => {
-      const msg = data.toString();
-      // Only log actual errors, not ffmpeg progress
-      if (msg.includes("Error") || msg.includes("Invalid")) {
-        console.error("[ffmpeg]:", msg.trim());
-        errorMsg += `[ffmpeg] ${msg}\n`;
-      }
-    });
+    const fail = (err) => {
+      if (hasErrored) return;
+      hasErrored = true;
+      killProcess(ytdlp, "yt-dlp");
+      killProcess(ffmpeg, "ffmpeg");
+      reject(err);
+    };
 
-    // yt-dlp exit handler
+    ytdlp.on("error", (e) =>
+      fail(new Error(`yt-dlp spawn error: ${e.message}`))
+    );
+    ffmpeg.on("error", (e) =>
+      fail(new Error(`ffmpeg spawn error: ${e.message}`))
+    );
+
     ytdlp.on("close", (code) => {
-      ytdlpExited = true;
-      console.log(`yt-dlp exited with code: ${code}`);
+      // If ffmpeg already succeeded and we resolved, don't reject here
+      if (hasErrored) return;
 
-      if (code !== 0 && !hasErrored) {
-        hasErrored = true;
-        killProcess(ffmpeg, "ffmpeg");
-        reject(
-          new Error(
-            `yt-dlp failed with code ${code}: ${errorMsg || "Unknown error"}`
-          )
-        );
+      if (code !== 0) {
+        fail(new Error(`yt-dlp failed (${code}): ${errorMsg}`));
       }
     });
 
-    ytdlp.on("error", (err) => {
-      if (!hasErrored) {
-        hasErrored = true;
-        console.error("yt-dlp spawn error:", err);
-        killProcess(ffmpeg, "ffmpeg");
-        reject(new Error(`yt-dlp error: ${err.message}`));
-      }
-    });
-
-    // ffmpeg exit handler
     ffmpeg.on("close", (code) => {
-      ffmpegExited = true;
-      console.log(`ffmpeg exited with code: ${code}`);
-
-      if (hasErrored) return; // Already rejected
+      if (hasErrored) return;
 
       if (code === 0 && fs.existsSync(previewPath)) {
-        console.log(`✅ Preview generated: ${previewPath}`);
-        resolve(previewPath);
-      } else {
+        // ✅ IMPORTANT: stop yt-dlp once we have enough preview
         killProcess(ytdlp, "yt-dlp");
-        const fileExists = fs.existsSync(previewPath);
-        reject(
-          new Error(
-            `Preview generation failed (code ${code}, file exists: ${fileExists}): ${
-              errorMsg || "Unknown error"
-            }`
-          )
-        );
+        return resolve(previewPath);
       }
-    });
 
-    ffmpeg.on("error", (err) => {
-      if (!hasErrored) {
-        hasErrored = true;
-        console.error("ffmpeg spawn error:", err);
-        killProcess(ytdlp, "yt-dlp");
-        reject(new Error(`ffmpeg error: ${err.message}`));
-      }
+      fail(new Error(`ffmpeg failed (${code}): ${errorMsg}`));
     });
   });
 }
@@ -488,17 +427,18 @@ app.get("/health", (req, res) => {
 
 app.get("/extract", async (req, res) => {
   const videoUrl = req.query.url;
-
-  if (!videoUrl) {
+  if (!videoUrl)
     return res.status(400).json({ error: "Missing 'url' parameter" });
-  }
-
-  if (!validateUrl(videoUrl)) {
+  if (!validateUrl(videoUrl))
     return res.status(400).json({ error: "Invalid URL format" });
-  }
 
   try {
     const data = await extractMetadata(videoUrl);
+
+    // 🔥 Warm preview in background (fast because it's -c copy)
+    getOrGeneratePreview(data.videoId, data.originalUrl, data.platform).catch(
+      () => {}
+    );
 
     res.json({
       ...data,
@@ -508,14 +448,7 @@ app.get("/extract", async (req, res) => {
       previewDuration: CONFIG.preview.duration,
     });
   } catch (err) {
-    let code = 500;
-    if (err.message.includes("Unsupported")) code = 400;
-    if (err.message.includes("timed out")) code = 504;
-
-    res.status(code).json({
-      error: "Extraction failed",
-      details: err.message,
-    });
+    res.status(500).json({ error: "Extraction failed", details: err.message });
   }
 });
 
