@@ -1,0 +1,24 @@
+{
+  "name": "api.imvid",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.2.1",
+    "ioredis": "^5.8.2",
+    "lru-cache": "^11.2.2",
+    "nodemon": "^3.1.11",
+    "p-queue": "^9.0.1",
+    "sanitize-filename": "^1.6.3",
+    "yt-dlp-wrap": "^2.3.12"
+  }
+}
