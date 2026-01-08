@@ -106,7 +106,7 @@ function getPlatformArgs(platform) {
   return args;
 }
 
-/// Replace the getAvailableFormats function with this improved version
+// REPLACE your current getAvailableFormats function with this complete version
 
 async function getAvailableFormats(videoUrl, platform) {
   const platformArgs = getPlatformArgs(platform);
@@ -130,6 +130,7 @@ async function getAvailableFormats(videoUrl, platform) {
 
     console.log(`📊 Total formats found: ${data.formats.length}`);
 
+    // Filter for video formats
     const videoFormats = data.formats.filter((format) => {
       return (
         format.vcodec &&
@@ -150,18 +151,21 @@ async function getAvailableFormats(videoUrl, platform) {
     const formatMap = new Map();
 
     for (const format of videoFormats) {
-      const resolutionKey = `${format.height}p`;
+      // Use the SHORTER dimension for quality detection (handles portrait videos)
+      const width = format.width || 0;
+      const height = format.height || 0;
+      const qualityDimension = Math.min(width, height);
+      const resolutionKey = `${qualityDimension}p`;
+
       const hasAudio = format.acodec && format.acodec !== "none";
 
       const formatInfo = {
         formatId: format.format_id,
         height: format.height,
         width: format.width || null,
+        qualityDimension: qualityDimension, // Store for quality naming
         ext: format.ext || "mp4",
         filesize: format.filesize || format.filesize_approx || null,
-        fps: format.fps || null,
-        vcodec: format.vcodec,
-        acodec: format.acodec || "none",
         hasAudio: hasAudio,
         tbr: format.tbr || null,
         vbr: format.vbr || null,
@@ -189,29 +193,31 @@ async function getAvailableFormats(videoUrl, platform) {
 
     // Convert to array and sort by resolution (highest first)
     const uniqueFormats = Array.from(formatMap.values())
-      .sort((a, b) => (b.height || 0) - (a.height || 0))
+      .sort((a, b) => (b.qualityDimension || 0) - (a.qualityDimension || 0))
       .map((f) => {
-        // Simple chip-friendly quality names
+        // Use qualityDimension (shorter side) for quality naming
+        const dimension = f.qualityDimension;
+
         let qualityName = "";
-        if (f.height >= 2160) qualityName = "4K";
-        else if (f.height >= 1440) qualityName = "2K";
-        else if (f.height >= 1080) qualityName = "Full HD";
-        else if (f.height >= 720) qualityName = "HD";
+        if (dimension >= 2160) qualityName = "4K";
+        else if (dimension >= 1440) qualityName = "2K";
+        else if (dimension >= 1080) qualityName = "Full HD";
+        else if (dimension >= 720) qualityName = "HD";
         else qualityName = "SD";
 
         return {
           formatId: f.formatId,
           ext: f.ext,
-          quality: `${f.height}p`, // "1080p", "720p" etc
-          hasAudio: f.hasAudio, // true/false (though you merge anyway)
-          filesize: f.filesize, // in bytes (convert to Long in Kotlin)
-          label: qualityName, // "Full HD", "HD" for chips
+          quality: `${dimension}p`, // Use shorter dimension: "720p", "540p", "480p"
+          hasAudio: f.hasAudio,
+          filesize: f.filesize,
+          label: qualityName,
         };
       });
 
     console.log(`✅ Final unique formats: ${uniqueFormats.length}`);
     uniqueFormats.forEach((f) => {
-      console.log(`   - ${f.label} [ID: ${f.formatId}]`);
+      console.log(`   - ${f.label} (${f.quality}) [ID: ${f.formatId}]`);
     });
 
     return uniqueFormats;
