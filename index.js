@@ -106,12 +106,14 @@ function getPlatformArgs(platform) {
   return args;
 }
 
+// Replace the getAvailableFormats function with this improved version
+
 async function getAvailableFormats(videoUrl, platform) {
   const platformArgs = getPlatformArgs(platform);
 
   const args = [
     videoUrl,
-    "-J", // Use JSON for reliable parsing
+    "-J",
     "--no-warnings",
     "--no-playlist",
     ...platformArgs,
@@ -128,9 +130,7 @@ async function getAvailableFormats(videoUrl, platform) {
 
     console.log(`📊 Total formats found: ${data.formats.length}`);
 
-    // Extract video formats with resolution info
     const videoFormats = data.formats.filter((format) => {
-      // Must have video codec and height
       return (
         format.vcodec &&
         format.vcodec !== "none" &&
@@ -155,17 +155,14 @@ async function getAvailableFormats(videoUrl, platform) {
 
       const formatInfo = {
         formatId: format.format_id,
-        quality: format.format_note || `${format.height}p`,
-        resolution:
-          format.resolution || `${format.width || "?"}x${format.height}`,
+        height: format.height,
+        width: format.width || null,
         ext: format.ext || "mp4",
         filesize: format.filesize || format.filesize_approx || null,
         fps: format.fps || null,
         vcodec: format.vcodec,
         acodec: format.acodec || "none",
         hasAudio: hasAudio,
-        height: format.height,
-        width: format.width || null,
         tbr: format.tbr || null,
         vbr: format.vbr || null,
       };
@@ -194,12 +191,23 @@ async function getAvailableFormats(videoUrl, platform) {
     const uniqueFormats = Array.from(formatMap.values())
       .sort((a, b) => (b.height || 0) - (a.height || 0))
       .map((f) => {
-        const sizeStr = f.filesize ? ` - ${formatFilesize(f.filesize)}` : "";
-        const audioStr = f.hasAudio ? "" : " (no audio)";
+        // Simple chip-friendly label with quality tier
+        let qualityName = "";
+        if (f.height >= 2160) qualityName = "4K";
+        else if (f.height >= 1440) qualityName = "2K";
+        else if (f.height >= 1080) qualityName = "Full HD";
+        else if (f.height >= 720) qualityName = "HD";
+        else qualityName = "SD";
 
         return {
-          ...f,
-          label: `${f.quality}${audioStr} (${f.ext})${sizeStr}`,
+          formatId: f.formatId,
+          ext: f.ext,
+          filesize: f.filesize,
+          height: f.height,
+          // Simple label for Material Design chips: "Full HD" or "HD" or "4K"
+          label: qualityName,
+          // Additional display info if needed: "1080p (mp4)"
+          detailLabel: `${f.height}p (${f.ext})`,
         };
       });
 
@@ -216,7 +224,7 @@ async function getAvailableFormats(videoUrl, platform) {
   }
 }
 
-// Helper function to format filesize (keep this the same)
+// Helper function to format filesize
 function formatFilesize(bytes) {
   if (!bytes) return "";
   const mb = bytes / (1024 * 1024);
