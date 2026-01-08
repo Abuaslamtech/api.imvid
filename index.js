@@ -50,8 +50,8 @@ const PLATFORMS = {
     extraArgs: [
       "--no-playlist",
       "--no-cache-dir",
-      "--extractor-args",
-      "youtube:player_client=android",
+      // "--extractor-args",
+      // "youtube:player_client=android",
     ],
   },
 
@@ -104,6 +104,126 @@ function getPlatformArgs(platform) {
   // }
 
   return args;
+}
+
+async function getAvailableFormats(videoUrl, platform) {
+  const platformArgs = getPlatformArgs(platform);
+
+  const args = [
+    videoUrl,
+    "-J", // Use JSON for reliable parsing
+    "--no-warnings",
+    "--no-playlist",
+    ...platformArgs,
+  ];
+
+  try {
+    const stdout = await ytdlpWrap.execPromise(args);
+    const data = JSON.parse(stdout);
+
+    if (!data.formats || !Array.isArray(data.formats)) {
+      console.warn("⚠️ No formats array found in response");
+      return [];
+    }
+
+    console.log(`📊 Total formats found: ${data.formats.length}`);
+
+    // Extract video formats with resolution info
+    const videoFormats = data.formats.filter((format) => {
+      // Must have video codec and height
+      return (
+        format.vcodec &&
+        format.vcodec !== "none" &&
+        format.height &&
+        format.height > 0
+      );
+    });
+
+    console.log(`📊 Video formats after filtering: ${videoFormats.length}`);
+
+    if (videoFormats.length === 0) {
+      console.warn("⚠️ No suitable video formats found");
+      return [];
+    }
+
+    // Group by resolution, keeping best quality for each
+    const formatMap = new Map();
+
+    for (const format of videoFormats) {
+      const resolutionKey = `${format.height}p`;
+      const hasAudio = format.acodec && format.acodec !== "none";
+
+      const formatInfo = {
+        formatId: format.format_id,
+        quality: format.format_note || `${format.height}p`,
+        resolution:
+          format.resolution || `${format.width || "?"}x${format.height}`,
+        ext: format.ext || "mp4",
+        filesize: format.filesize || format.filesize_approx || null,
+        fps: format.fps || null,
+        vcodec: format.vcodec,
+        acodec: format.acodec || "none",
+        hasAudio: hasAudio,
+        height: format.height,
+        width: format.width || null,
+        tbr: format.tbr || null,
+        vbr: format.vbr || null,
+      };
+
+      if (!formatMap.has(resolutionKey)) {
+        formatMap.set(resolutionKey, formatInfo);
+      } else {
+        const existing = formatMap.get(resolutionKey);
+
+        // Prefer formats WITH audio
+        if (hasAudio && !existing.hasAudio) {
+          formatMap.set(resolutionKey, formatInfo);
+        }
+        // If both have same audio status, prefer higher bitrate
+        else if (hasAudio === existing.hasAudio) {
+          const currentBr = formatInfo.tbr || formatInfo.vbr || 0;
+          const existingBr = existing.tbr || existing.vbr || 0;
+          if (currentBr > existingBr) {
+            formatMap.set(resolutionKey, formatInfo);
+          }
+        }
+      }
+    }
+
+    // Convert to array and sort by resolution (highest first)
+    const uniqueFormats = Array.from(formatMap.values())
+      .sort((a, b) => (b.height || 0) - (a.height || 0))
+      .map((f) => {
+        const sizeStr = f.filesize ? ` - ${formatFilesize(f.filesize)}` : "";
+        const audioStr = f.hasAudio ? "" : " (no audio)";
+
+        return {
+          ...f,
+          label: `${f.quality}${audioStr} (${f.ext})${sizeStr}`,
+        };
+      });
+
+    console.log(`✅ Final unique formats: ${uniqueFormats.length}`);
+    uniqueFormats.forEach((f) => {
+      console.log(`   - ${f.label} [ID: ${f.formatId}]`);
+    });
+
+    return uniqueFormats;
+  } catch (err) {
+    console.error("❌ Error fetching formats:", err.message);
+    console.error("Stack:", err.stack);
+    return [];
+  }
+}
+
+// Helper function to format filesize (keep this the same)
+function formatFilesize(bytes) {
+  if (!bytes) return "";
+  const mb = bytes / (1024 * 1024);
+  if (mb < 1024) {
+    return `${mb.toFixed(1)} MB`;
+  }
+  return `${(mb / 1024).toFixed(2)} GB`;
 }
 
 function validateUrl(url) {
@@ -226,6 +346,9 @@ async function extractMetadata(videoUrl) {
       ? `${meta.width}x${meta.height}`
       : meta.format_note || "unknown";
 
+  // Get available formats
+  const availableFormats = await getAvailableFormats(videoUrl, platform);
+
   const metadata = {
     title: meta.title || "Unknown Title",
     author: meta.uploader || meta.channel || "Unknown Author",
@@ -238,9 +361,9 @@ async function extractMetadata(videoUrl) {
     filesize: meta.filesize_approx || meta.filesize || null,
     resolution,
     format: meta.ext || "mp4",
+    availableFormats: availableFormats, // Add this
   };
 
-  // Cache by both URL and ID with consistent structure
   const cacheEntry = {
     metadata,
     timestamp: Date.now(),
@@ -252,6 +375,29 @@ async function extractMetadata(videoUrl) {
 
   return metadata;
 }
+
+// ADD new endpoint for getting formats (add after /extract route)
+
+app.get("/formats", async (req, res) => {
+  const videoId = req.query.vid;
+
+  if (!videoId) {
+    return res.status(400).json({ error: "Missing 'vid' parameter" });
+  }
+
+  const cached = cache.get(videoId);
+  if (!cached || !cached.metadata) {
+    return res.status(404).json({ error: "Video ID not found or expired" });
+  }
+
+  const { availableFormats } = cached.metadata;
+
+  if (!availableFormats || availableFormats.length === 0) {
+    return res.status(404).json({ error: "No formats available" });
+  }
+
+  res.json({ formats: availableFormats });
+});
 
 // ---------------------------
 // PREVIEW GENERATION (WITH CONCURRENCY CONTROL)
@@ -561,6 +707,7 @@ function serveVideoFile(filePath, req, res) {
 
 app.get("/download", async (req, res) => {
   const videoId = req.query.vid;
+  const formatId = req.query.format;
 
   if (!videoId) {
     return res.status(400).json({ error: "Missing 'vid' parameter" });
@@ -576,7 +723,31 @@ app.get("/download", async (req, res) => {
   const cfg = PLATFORMS[platform];
   const platformArgs = getPlatformArgs(platform);
 
-  console.log(`⬇️ Streaming: ${metadata.title}`);
+  let formatString;
+
+  if (formatId) {
+    // User selected specific format
+    // Check if the selected format has audio
+    const selectedFormat = metadata.availableFormats?.find(
+      (f) => f.formatId === formatId
+    );
+
+    if (selectedFormat && selectedFormat.hasAudio) {
+      // Format already has audio, use it directly
+      formatString = formatId;
+      console.log(
+        `⬇️ Streaming format ${formatId} (with audio): ${metadata.title}`
+      );
+    } else {
+      // Format is video-only, merge with best audio
+      formatString = `${formatId}+bestaudio[ext=m4a]/bestaudio/best`;
+      console.log(`⬇️ Streaming format ${formatId} + audio: ${metadata.title}`);
+    }
+  } else {
+    // Use default platform format
+    formatString = cfg.format;
+    console.log(`⬇️ Streaming (default quality): ${metadata.title}`);
+  }
 
   const filename = metadata.title.replace(/[^a-z0-9]/gi, "_").substring(0, 50);
 
@@ -591,7 +762,7 @@ app.get("/download", async (req, res) => {
     "-o",
     "-",
     "-f",
-    cfg.format,
+    formatString,
     "--no-playlist",
     "--no-warnings",
     "--no-progress",
