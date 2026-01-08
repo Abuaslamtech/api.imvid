@@ -106,7 +106,7 @@ function getPlatformArgs(platform) {
   return args;
 }
 
-// Replace the getAvailableFormats function with this improved version
+/// Replace the getAvailableFormats function with this improved version
 
 async function getAvailableFormats(videoUrl, platform) {
   const platformArgs = getPlatformArgs(platform);
@@ -191,7 +191,7 @@ async function getAvailableFormats(videoUrl, platform) {
     const uniqueFormats = Array.from(formatMap.values())
       .sort((a, b) => (b.height || 0) - (a.height || 0))
       .map((f) => {
-        // Simple chip-friendly label with quality tier
+        // Simple chip-friendly quality names
         let qualityName = "";
         if (f.height >= 2160) qualityName = "4K";
         else if (f.height >= 1440) qualityName = "2K";
@@ -202,12 +202,10 @@ async function getAvailableFormats(videoUrl, platform) {
         return {
           formatId: f.formatId,
           ext: f.ext,
-          filesize: f.filesize,
-          height: f.height,
-          // Simple label for Material Design chips: "Full HD" or "HD" or "4K"
-          label: qualityName,
-          // Additional display info if needed: "1080p (mp4)"
-          detailLabel: `${f.height}p (${f.ext})`,
+          quality: `${f.height}p`, // "1080p", "720p" etc
+          hasAudio: f.hasAudio, // true/false (though you merge anyway)
+          filesize: f.filesize, // in bytes (convert to Long in Kotlin)
+          label: qualityName, // "Full HD", "HD" for chips
         };
       });
 
