@@ -17,9 +17,9 @@ const port = process.env.PORT || 3000;
 const CONFIG = {
   binaryPath: "/usr/local/bin/yt-dlp",
   ffmpegPath: "/usr/bin/ffmpeg",
-  extractTimeout: 30000,
-  cacheTTL: 1800000, // 30 minutes
-  cacheCleanupInterval: 300000, // 5 minutes
+  extractTimeout: 120000,
+  cacheTTL: 1800000, 
+  cacheCleanupInterval: 300000, 
   maxRetries: 2,
   retryDelay: 2000,
   preview: {
@@ -50,8 +50,9 @@ const PLATFORMS = {
     extraArgs: [
       "--no-playlist",
       "--no-cache-dir",
-      // "--extractor-args",
-      // "youtube:player_client=android",
+      "--extractor-args",
+      "--extractor-args", 
+      "youtube:player_client=android,web", 
     ],
   },
 
@@ -99,9 +100,9 @@ function getPlatformArgs(platform) {
   const args = [...cfg.extraArgs];
   const cookiePath = path.resolve(__dirname, cfg.cookiesFile);
 
-  // if (fs.existsSync(cookiePath)) {
-  //   args.push("--cookies", cookiePath);
-  // }
+  if (fs.existsSync(cookiePath)) {
+    args.push("--cookies", cookiePath);
+  }
 
   return args;
 }
