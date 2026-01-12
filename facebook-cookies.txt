@@ -4,9 +4,6 @@
 .facebook.com	TRUE	/	TRUE	1782418548	datr	dDQuaGOCoo0DjcKZ_DT6ejbh
 .facebook.com	TRUE	/	TRUE	1772298460	fr	1iFS60iNz5acc8XVU.AWdn3WcMZJhdYxEjt7RGaiO8I3f4k0vti5S1oOt_wIapSUgcVz4.BpLHnb..AAA.0.0.BpLHnb.AWfZAQRZdvkzsskJf2eV-gHl93Y
 .facebook.com	TRUE	/	TRUE	1782418581	sb	dDQuaICPkVBjHGzhbynQCKo_
-.facebook.com	TRUE	/	TRUE	1796058460	c_user	100089904504748
-.facebook.com	TRUE	/	TRUE	1796058460	xs	4%3ApkElIYEtQH8VoA%3A2%3A1747858578%3A-1%3A-1%3A%3AAcwZColhoNsOhqmR3JQLAsYjcQrWvMTTo3BaecBdeWA
 .facebook.com	TRUE	/	TRUE	1788261541	ps_l	1
 .facebook.com	TRUE	/	TRUE	1788261541	ps_n	1
 .facebook.com	TRUE	/	TRUE	1765127289	wd	1865x933
-.facebook.com	TRUE	/	TRUE	0	presence	C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1764522491667%2C%22v%22%3A1%7D

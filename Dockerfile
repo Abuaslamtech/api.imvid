@@ -1,9 +1,8 @@
-# Use a lightweight Debian-based Node image
 FROM node:20-slim
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y \
     python3 \
+    python3-pip \
     ffmpeg \
     aria2 \
     curl \
@@ -15,21 +14,19 @@ RUN apt-get update && apt-get install -y \
 # Install Deno system-wide
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
-# Install yt-dlp
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-    -o /usr/local/bin/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp
+# Install yt-dlp with recommended optional dependency groups
+# - default: recommended for PyPI users for YouTube JS components
+# - curl-cffi: provides impersonation support if available for your platform
+RUN pip3 install --no-cache-dir -U "yt-dlp[default,curl-cffi]"
 
-# Verify installations
-RUN deno --version && yt-dlp --version
+# Ensure a stable yt-dlp path
+RUN which yt-dlp && yt-dlp --version && deno --version
 
-# App setup
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --only=production
 COPY . .
 
-# Render assigns PORT dynamically
 EXPOSE 3000
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
