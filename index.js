@@ -645,7 +645,7 @@ async function startup() {
 
   setInterval(cleanupCache, CONFIG.cacheCleanupIntervalMs);
 
-  app.listen(port, () => {
+  app.listen(port, "0.0.0.0", () => {
     console.log(`🚀 V2 server listening on :${port}`);
   });
 }
