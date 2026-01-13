@@ -6,6 +6,7 @@ const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { pipeline } = require("stream");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -417,7 +418,6 @@ async function generatePreviewMp4(originalUrl, platform, videoId) {
   return new Promise((resolve, reject) => {
     const platformArgs = getPlatformArgs(platform);
 
-    // pick a very small/fast format; fall back if not available
     const previewFormat =
       "worstvideo[ext=mp4][vcodec^=avc1][height<=480]+worstaudio[ext=m4a]/" +
       "worst[ext=mp4][height<=480]/worst";
@@ -442,7 +442,7 @@ async function generatePreviewMp4(originalUrl, platform, videoId) {
       "-vf",
       `scale=${CONFIG.preview.width}:-2:force_original_aspect_ratio=decrease,` +
         `scale=trunc(iw/2)*2:trunc(ih/2)*2`,
-      "-an", // mute preview for speed
+      "-an",
       "-c:v",
       "libx264",
       "-preset",
@@ -462,18 +462,43 @@ async function generatePreviewMp4(originalUrl, platform, videoId) {
     });
 
     let err = "";
+    let cleaned = false;
+
+    function cleanup() {
+      if (cleaned) return;
+      cleaned = true;
+
+      // stop piping safely
+      try {
+        ytdlp.stdout.unpipe(ffmpeg.stdin);
+      } catch {}
+      try {
+        ffmpeg.stdin.end();
+      } catch {}
+
+      if (!ytdlp.killed) ytdlp.kill("SIGKILL");
+      if (!ffmpeg.killed) ffmpeg.kill("SIGKILL");
+
+      semYtDlp.release();
+      semFfmpeg.release();
+    }
+
     ytdlp.stderr.on("data", (d) => (err += d.toString("utf8")));
     ffmpeg.stderr.on("data", (d) => (err += d.toString("utf8")));
 
-    // pipe stdout -> ffmpeg stdin
-    ytdlp.stdout.pipe(ffmpeg.stdin);
+    // IMPORTANT: ignore broken pipe errors from the pipe itself
+    ffmpeg.stdin.on("error", (e) => {
+      if (e.code === "EPIPE" || e.code === "ECONNRESET") return;
+      cleanup();
+      reject(e);
+    });
+    ytdlp.stdout.on("error", (e) => {
+      if (e.code === "EPIPE" || e.code === "ECONNRESET") return;
+      cleanup();
+      reject(e);
+    });
 
-    const cleanup = () => {
-      if (!ytdlp.killed) ytdlp.kill("SIGKILL");
-      if (!ffmpeg.killed) ffmpeg.kill("SIGKILL");
-      semYtDlp.release();
-      semFfmpeg.release();
-    };
+    ytdlp.stdout.pipe(ffmpeg.stdin);
 
     ytdlp.on("error", (e) => {
       cleanup();
@@ -485,12 +510,14 @@ async function generatePreviewMp4(originalUrl, platform, videoId) {
     });
 
     ffmpeg.on("close", (code) => {
+      if (code === 0 && fs.existsSync(outPath)) {
+        cleanup();
+        return resolve(outPath);
+      }
       cleanup();
-      if (code === 0 && fs.existsSync(outPath)) return resolve(outPath);
       reject(new Error(`ffmpeg failed (code ${code}): ${err.slice(-4000)}`));
     });
 
-    // If yt-dlp exits non-zero early, fail fast
     ytdlp.on("close", (code) => {
       if (code !== 0) {
         cleanup();
@@ -518,11 +545,7 @@ async function getOrGeneratePreview(videoId) {
       throw new Error("Video ID not found or expired");
 
     const { originalUrl, platform } = metaEntry;
-    const filePath = await generatePreviewMp4(
-      originalUrl,
-      platform,
-      videoId
-    );
+    const filePath = await generatePreviewMp4(originalUrl, platform, videoId);
     previewCache.set(videoId, { path: filePath, timestamp: Date.now() });
     return filePath;
   })().finally(() => {
@@ -536,6 +559,7 @@ async function getOrGeneratePreview(videoId) {
 // ---------------------------
 // RANGE-AWARE FILE SERVE
 // ---------------------------
+
 function serveVideoFile(filePath, req, res) {
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
@@ -545,28 +569,37 @@ function serveVideoFile(filePath, req, res) {
   res.setHeader("Accept-Ranges", "bytes");
   res.setHeader("Cache-Control", "public, max-age=3600");
 
-  if (!range) {
+  let start = 0;
+  let end = fileSize - 1;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, "").split("-");
+    start = parseInt(parts[0], 10);
+    end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+    if (Number.isNaN(start) || Number.isNaN(end) || start > end) {
+      res.status(416).end();
+      return;
+    }
+
+    res.status(206);
+    res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+    res.setHeader("Content-Length", end - start + 1);
+  } else {
     res.setHeader("Content-Length", fileSize);
-    fs.createReadStream(filePath).pipe(res);
-    return;
   }
 
-  const parts = range.replace(/bytes=/, "").split("-");
-  const start = parseInt(parts[0], 10);
-  const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+  const fileStream = fs.createReadStream(filePath, { start, end });
 
-  if (Number.isNaN(start) || Number.isNaN(end) || start > end) {
-    res.status(416).end();
-    return;
-  }
+  // If client disconnects, stop reading immediately
+  res.on("close", () => fileStream.destroy());
 
-  const chunkSize = end - start + 1;
-
-  res.status(206);
-  res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
-  res.setHeader("Content-Length", chunkSize);
-
-  fs.createReadStream(filePath, { start, end }).pipe(res);
+  pipeline(fileStream, res, (err) => {
+    if (!err) return;
+    // Ignore common disconnect errors
+    if (err.code === "EPIPE" || err.code === "ECONNRESET") return;
+    console.error("serveVideoFile pipeline error:", err);
+  });
 }
 
 // ---------------------------
@@ -707,25 +740,31 @@ app.get("/api/video/download", async (req, res) => {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  proc.stdout.pipe(res);
+  pipeline(proc.stdout, res, (err) => {
+    if (!err) return;
+    if (err.code === "EPIPE" || err.code === "ECONNRESET") return;
+    console.error("download pipeline error:", err);
+  });
 
   proc.stderr.on("data", (d) => {
     const msg = d.toString("utf8");
-    // keep logs low-noise but useful
     if (msg.includes("ERROR") || msg.includes("WARNING")) {
       console.error("[yt-dlp]", msg.trim());
     }
   });
 
   proc.on("error", (err) => {
-    if (!res.headersSent)
+    if (!res.headersSent) {
       res
         .status(500)
         .json({ error: "Failed to start download", details: err.message });
+    }
   });
 
   req.on("close", () => {
-    // client disconnected
+    try {
+      proc.stdout.unpipe(res);
+    } catch {}
     if (!proc.killed) proc.kill("SIGKILL");
   });
 });
