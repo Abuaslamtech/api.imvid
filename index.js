@@ -518,7 +518,7 @@ async function getOrGeneratePreview(videoId) {
       throw new Error("Video ID not found or expired");
 
     const { originalUrl, platform } = metaEntry;
-    const filePath = await generatePreviewMp4FromYtDlp(
+    const filePath = await generatePreviewMp4(
       originalUrl,
       platform,
       videoId
