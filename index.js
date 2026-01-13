@@ -18,12 +18,12 @@ const CONFIG = {
   ffmpegPath: process.env.FFMPEG_PATH || "/usr/bin/ffmpeg",
 
   extractTimeoutMs: 45_000,
-  cacheTTLms: 15 * 60_000,          // 15 min
+  cacheTTLms: 15 * 60_000, // 15 min
   cacheCleanupIntervalMs: 2 * 60_000,
 
   preview: {
-    seconds: 4,                     // fastest: fixed first segment
-    width: 360,                     // small for fast encode
+    seconds: 4, // fastest: fixed first segment
+    width: 360, // small for fast encode
     crf: 28,
     preset: "veryfast",
   },
@@ -144,7 +144,9 @@ function runYtDlpJson(args, timeoutMs) {
   return new Promise(async (resolve, reject) => {
     await semYtDlp.acquire();
 
-    const proc = spawn(CONFIG.ytDlpPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn(CONFIG.ytDlpPath, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
 
     let stdout = "";
     let stderr = "";
@@ -170,16 +172,28 @@ function runYtDlpJson(args, timeoutMs) {
 
       if (code !== 0) {
         // include stderr for real debugging signal
-        return reject(new Error(`yt-dlp failed (code ${code}): ${stderr.slice(-4000)}`));
+        return reject(
+          new Error(`yt-dlp failed (code ${code}): ${stderr.slice(-4000)}`)
+        );
       }
       if (!stdout.trim()) {
-        return reject(new Error(`yt-dlp returned empty stdout. stderr: ${stderr.slice(-2000)}`));
+        return reject(
+          new Error(
+            `yt-dlp returned empty stdout. stderr: ${stderr.slice(-2000)}`
+          )
+        );
       }
 
       try {
         resolve({ json: JSON.parse(stdout), stderr });
       } catch (e) {
-        reject(new Error(`Failed to parse yt-dlp JSON: ${e.message}. stderr: ${stderr.slice(-2000)}`));
+        reject(
+          new Error(
+            `Failed to parse yt-dlp JSON: ${e.message}. stderr: ${stderr.slice(
+              -2000
+            )}`
+          )
+        );
       }
     });
   });
@@ -209,7 +223,9 @@ function buildAvailableFormats(raw) {
   if (!formats.length) return [];
 
   // Keep only video formats with some dimension
-  const videoFormats = formats.filter((f) => isVideo(f) && (f.height || f.width));
+  const videoFormats = formats.filter(
+    (f) => isVideo(f) && (f.height || f.width)
+  );
 
   // Group by "quality bucket" based on shorter dimension
   const byQ = new Map();
@@ -259,14 +275,16 @@ function pickPreviewDirectUrl(raw) {
   if (!formats.length) return null;
 
   // Candidates: video formats with a direct URL
-  const candidates = formats.filter((f) => isVideo(f) && typeof f.url === "string" && f.url.startsWith("http"));
+  const candidates = formats.filter(
+    (f) => isVideo(f) && typeof f.url === "string" && f.url.startsWith("http")
+  );
 
   if (!candidates.length) return null;
 
   // Score and pick best for preview speed
   // Lower resolution is faster to fetch/encode
   const scored = candidates.map((f) => {
-    const q = minDimension(f) || (f.height || 0) || 9999;
+    const q = minDimension(f) || f.height || 0 || 9999;
     const ext = (f.ext || "").toLowerCase();
     const vcodec = (f.vcodec || "").toLowerCase();
 
@@ -296,7 +314,7 @@ function pickDefaultFormat(availableFormats) {
   if (!availableFormats || !availableFormats.length) return null;
   // Prefer highest that has audio; otherwise highest overall.
   const withAudio = availableFormats.filter((f) => f.hasAudio);
-  return (withAudio[0] || availableFormats[0]) || null;
+  return withAudio[0] || availableFormats[0] || null;
 }
 
 function pickResolutionFromRaw(raw) {
@@ -342,7 +360,8 @@ async function extractOnce(url) {
     const availableFormats = buildAvailableFormats(raw);
     const defaultFmt = pickDefaultFormat(availableFormats);
 
-    const videoId = raw.id || crypto.createHash("sha1").update(url).digest("hex");
+    const videoId =
+      raw.id || crypto.createHash("sha1").update(url).digest("hex");
     const resolution = pickResolutionFromRaw(raw);
 
     // Your VideoInfo shape (backend response)
@@ -354,9 +373,11 @@ async function extractOnce(url) {
       platform,
       videoId,
       originalUrl: url,
-      filesize: Number(raw.filesize || raw.filesize_approx || defaultFmt?.filesize || 0),
+      filesize: Number(
+        raw.filesize || raw.filesize_approx || defaultFmt?.filesize || 0
+      ),
       resolution,
-      format: defaultFmt?.ext || (raw.ext || "mp4"),
+      format: defaultFmt?.ext || raw.ext || "mp4",
       previewUrl: `/api/video/preview?vid=${encodeURIComponent(videoId)}`,
       downloadUrl: `/api/video/download?vid=${encodeURIComponent(videoId)}`,
       previewType: "video/mp4",
@@ -384,48 +405,108 @@ async function extractOnce(url) {
 // ---------------------------
 // PREVIEW GENERATION (ffmpeg direct URL)
 // ---------------------------
-async function generatePreviewMp4(directUrl, videoId) {
+async function generatePreviewMp4(originalUrl, platform, videoId) {
+  await semYtDlp.acquire();
   await semFfmpeg.acquire();
-  const outPath = path.join(os.tmpdir(), `preview_${videoId}_${Date.now()}.mp4`);
+
+  const outPath = path.join(
+    os.tmpdir(),
+    `preview_${videoId}_${Date.now()}.mp4`
+  );
 
   return new Promise((resolve, reject) => {
-    const args = [
-  "-y",
-  "-ss", "0",
-  "-t", String(CONFIG.preview.seconds),
-  "-i", directUrl,
-  "-vf",
-  `scale=${CONFIG.preview.width}:-2:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`,
-  "-an",
-  "-c:v", "libx264",
-  "-preset", CONFIG.preview.preset,
-  "-crf", String(CONFIG.preview.crf),
-  "-movflags", "+faststart",
-  outPath,
-];
+    const platformArgs = getPlatformArgs(platform);
 
+    // pick a very small/fast format; fall back if not available
+    const previewFormat =
+      "worstvideo[ext=mp4][vcodec^=avc1][height<=480]+worstaudio[ext=m4a]/" +
+      "worst[ext=mp4][height<=480]/worst";
 
-    const ff = spawn(CONFIG.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    const ytdlpArgs = [
+      originalUrl,
+      "-o",
+      "-",
+      "-f",
+      previewFormat,
+      "--no-playlist",
+      "--no-warnings",
+      ...platformArgs,
+    ];
 
-    let stderr = "";
-    ff.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+    const ffArgs = [
+      "-y",
+      "-t",
+      String(CONFIG.preview.seconds),
+      "-i",
+      "pipe:0",
+      "-vf",
+      `scale=${CONFIG.preview.width}:-2:force_original_aspect_ratio=decrease,` +
+        `scale=trunc(iw/2)*2:trunc(ih/2)*2`,
+      "-an", // mute preview for speed
+      "-c:v",
+      "libx264",
+      "-preset",
+      CONFIG.preview.preset,
+      "-crf",
+      String(CONFIG.preview.crf),
+      "-movflags",
+      "+faststart",
+      outPath,
+    ];
 
-    ff.on("error", (err) => {
-      semFfmpeg.release();
-      reject(err);
+    const ytdlp = spawn(CONFIG.ytDlpPath, ytdlpArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const ffmpeg = spawn(CONFIG.ffmpegPath, ffArgs, {
+      stdio: ["pipe", "ignore", "pipe"],
     });
 
-    ff.on("close", (code) => {
+    let err = "";
+    ytdlp.stderr.on("data", (d) => (err += d.toString("utf8")));
+    ffmpeg.stderr.on("data", (d) => (err += d.toString("utf8")));
+
+    // pipe stdout -> ffmpeg stdin
+    ytdlp.stdout.pipe(ffmpeg.stdin);
+
+    const cleanup = () => {
+      if (!ytdlp.killed) ytdlp.kill("SIGKILL");
+      if (!ffmpeg.killed) ffmpeg.kill("SIGKILL");
+      semYtDlp.release();
       semFfmpeg.release();
+    };
+
+    ytdlp.on("error", (e) => {
+      cleanup();
+      reject(new Error(`yt-dlp error: ${e.message}`));
+    });
+    ffmpeg.on("error", (e) => {
+      cleanup();
+      reject(new Error(`ffmpeg error: ${e.message}`));
+    });
+
+    ffmpeg.on("close", (code) => {
+      cleanup();
       if (code === 0 && fs.existsSync(outPath)) return resolve(outPath);
-      reject(new Error(`ffmpeg failed (code ${code}): ${stderr.slice(-4000)}`));
+      reject(new Error(`ffmpeg failed (code ${code}): ${err.slice(-4000)}`));
+    });
+
+    // If yt-dlp exits non-zero early, fail fast
+    ytdlp.on("close", (code) => {
+      if (code !== 0) {
+        cleanup();
+        reject(new Error(`yt-dlp failed (code ${code}): ${err.slice(-4000)}`));
+      }
     });
   });
 }
 
 async function getOrGeneratePreview(videoId) {
   const cached = previewCache.get(videoId);
-  if (cached && Date.now() - cached.timestamp < CONFIG.cacheTTLms && fs.existsSync(cached.path)) {
+  if (
+    cached &&
+    Date.now() - cached.timestamp < CONFIG.cacheTTLms &&
+    fs.existsSync(cached.path)
+  ) {
     return cached.path;
   }
 
@@ -433,12 +514,15 @@ async function getOrGeneratePreview(videoId) {
 
   const p = (async () => {
     const metaEntry = metaCache.get(videoId);
-    if (!metaEntry || !metaEntry.data) throw new Error("Video ID not found or expired");
+    if (!metaEntry || !metaEntry.data)
+      throw new Error("Video ID not found or expired");
 
-    const directUrl = metaEntry.data._previewDirectUrl;
-    if (!directUrl) throw new Error("No direct format URL available for preview");
-
-    const filePath = await generatePreviewMp4(directUrl, videoId);
+    const { originalUrl, platform } = metaEntry;
+    const filePath = await generatePreviewMp4FromYtDlp(
+      originalUrl,
+      platform,
+      videoId
+    );
     previewCache.set(videoId, { path: filePath, timestamp: Date.now() });
     return filePath;
   })().finally(() => {
@@ -517,8 +601,16 @@ app.get("/health", async (req, res) => {
     previewCacheSize: previewCache.size,
     inflightExtract: inflightExtract.size,
     inflightPreview: inflightPreview.size,
-    semYtDlp: { running: semYtDlp.getCurrent(), queued: semYtDlp.getQueued(), max: CONFIG.maxConcurrentYtDlp },
-    semFfmpeg: { running: semFfmpeg.getCurrent(), queued: semFfmpeg.getQueued(), max: CONFIG.maxConcurrentFfmpeg },
+    semYtDlp: {
+      running: semYtDlp.getCurrent(),
+      queued: semYtDlp.getQueued(),
+      max: CONFIG.maxConcurrentYtDlp,
+    },
+    semFfmpeg: {
+      running: semFfmpeg.getCurrent(),
+      queued: semFfmpeg.getQueued(),
+      max: CONFIG.maxConcurrentFfmpeg,
+    },
     uptime: process.uptime(),
   });
 });
@@ -527,7 +619,8 @@ app.get("/health", async (req, res) => {
 app.get("/api/video/info", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "Missing 'url' parameter" });
-  if (!validateUrl(url)) return res.status(400).json({ error: "Invalid URL format" });
+  if (!validateUrl(url))
+    return res.status(400).json({ error: "Invalid URL format" });
 
   try {
     const data = await extractOnce(url);
@@ -537,7 +630,8 @@ app.get("/api/video/info", async (req, res) => {
 
     // Return only the fields your Android model expects
     const {
-      _raw, _previewDirectUrl, // strip internal fields
+      _raw,
+      _previewDirectUrl, // strip internal fields
       ...publicData
     } = data;
 
@@ -567,7 +661,8 @@ app.get("/api/video/download", async (req, res) => {
   if (!vid) return res.status(400).json({ error: "Missing 'vid' parameter" });
 
   const entry = metaCache.get(String(vid));
-  if (!entry || !entry.data) return res.status(404).json({ error: "Video ID not found or expired" });
+  if (!entry || !entry.data)
+    return res.status(404).json({ error: "Video ID not found or expired" });
 
   const { originalUrl, platform } = entry;
   const platformArgs = getPlatformArgs(platform);
@@ -579,14 +674,21 @@ app.get("/api/video/download", async (req, res) => {
   // - else: choose a sane default best mp4-ish
   let formatString = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b";
   if (formatId) {
-    const selected = entry.data.availableFormats?.find((f) => String(f.formatId) === String(formatId));
+    const selected = entry.data.availableFormats?.find(
+      (f) => String(f.formatId) === String(formatId)
+    );
     if (selected?.hasAudio) formatString = String(formatId);
     else formatString = `${String(formatId)}+bestaudio[ext=m4a]/bestaudio/best`;
   }
 
   // Filename (safe-ish)
-  const safeName = (entry.data.title || "video").replace(/[^a-z0-9]+/gi, "_").slice(0, 60);
-  res.setHeader("Content-Disposition", `attachment; filename="${safeName}.mp4"`);
+  const safeName = (entry.data.title || "video")
+    .replace(/[^a-z0-9]+/gi, "_")
+    .slice(0, 60);
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="${safeName}.mp4"`
+  );
   res.setHeader("Content-Type", "video/mp4");
 
   const args = [
@@ -601,7 +703,9 @@ app.get("/api/video/download", async (req, res) => {
     ...platformArgs,
   ];
 
-  const proc = spawn(CONFIG.ytDlpPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const proc = spawn(CONFIG.ytDlpPath, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 
   proc.stdout.pipe(res);
 
@@ -614,7 +718,10 @@ app.get("/api/video/download", async (req, res) => {
   });
 
   proc.on("error", (err) => {
-    if (!res.headersSent) res.status(500).json({ error: "Failed to start download", details: err.message });
+    if (!res.headersSent)
+      res
+        .status(500)
+        .json({ error: "Failed to start download", details: err.message });
   });
 
   req.on("close", () => {
@@ -640,7 +747,9 @@ async function startup() {
     process.exit(1);
   }
   if (!checkBinaryExists(CONFIG.ffmpegPath)) {
-    console.warn(`⚠️ ffmpeg missing at ${CONFIG.ffmpegPath} (preview disabled)`);
+    console.warn(
+      `⚠️ ffmpeg missing at ${CONFIG.ffmpegPath} (preview disabled)`
+    );
   }
 
   setInterval(cleanupCache, CONFIG.cacheCleanupIntervalMs);
